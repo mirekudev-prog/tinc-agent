@@ -41,6 +41,26 @@ export const tools = {
     },
     async execute({ path, content }) {
       try {
+        // Anti-Flaw Protocol: Check for full overwrite risk
+        let existingContent = '';
+        try {
+          existingContent = await fs.readFile(path, 'utf-8');
+        } catch {}
+
+        if (existingContent && existingContent.length > 0) {
+          const similarity = calculateSimilarity(existingContent, content);
+          if (similarity < 0.2) {
+            return {
+              success: false,
+              error: `FULL OVERWRITE RISK: New content differs by more than 80% from existing file. Use a targeted edit instead.`,
+              overwriteRisk: true,
+              existingSize: existingContent.length,
+              newSize: content.length,
+              similarity: Math.round(similarity * 100)
+            };
+          }
+        }
+
         await fs.writeFile(path, content, 'utf-8');
         return { success: true };
       } catch (error) {

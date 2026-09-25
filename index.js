@@ -1,15 +1,30 @@
 #!/usr/bin/env node
-
 /**
  * TINC - Terminal Intelligence for Nexus Coding
  * Lightweight AI coding agent for Termux
- * Self-updating: knows its own GitHub repo, can clone/edit/push itself
+ * 
+ * TUI: Lightweight Terminal User Interface (NO alternate screen buffer)
+ * Raw ANSI escape codes only - Termux native touch scrolling works
  */
 
 import { program } from 'commander';
 import { runLoop } from './loop.js';
 import { loadBoot, appendMemory, readMemory } from './memory.js';
 import { getConfig, selfPush, verifyGitSetup, selfClone } from './config.js';
+import tui, { updateTUIStatus } from './tui.js';
+
+let currentStatus = {
+  model: '',
+  provider: '',
+  tokens: 0,
+  task: 'idle',
+  thinking: false
+};
+
+function syncStatus(status) {
+  currentStatus = { ...currentStatus, ...status };
+  tui.updateStatusBar(currentStatus);
+}
 
 program
   .name('tinc')
@@ -23,6 +38,23 @@ program
   .option('-m, --model <model>', 'Model name (leave empty to use configured)')
   .action(async (options) => {
     const boot = await loadBoot();
+    
+    // Clear screen and show TUI
+    tui.clearScreen();
+    tui.updateStatusBar({
+      model: options.model || 'not set',
+      provider: options.provider,
+      tokens: 0,
+      task: 'starting',
+      thinking: false
+    });
+    
+    // Small delay so status renders first
+    await new Promise(r => setTimeout(r, 50));
+    
+    tui.pushOutput('🔧 TINC started. Type /help for commands.\n');
+    syncStatus({ task: 'running' });
+    
     await runLoop(options.provider, options.model, boot);
   });
 
@@ -30,10 +62,17 @@ program
   .command('reload')
   .description('Reload boot.md and memory.md, restart loop')
   .action(async () => {
-    console.log('Reloading configuration...');
+    tui.pushOutput('🔄 Reloading configuration...\n');
+    syncStatus({ task: 'reloading', thinking: true });
+    
+    await new Promise(r => setTimeout(r, 100));
+    
     const boot = await loadBoot();
     const memory = await readMemory();
-    console.log('Configuration reloaded. Restarting loop...');
+    
+    tui.pushOutput('Configuration reloaded. Restarting loop...\n');
+    syncStatus({ task: 'running', thinking: false });
+    
     process.env.TINC_RELOAD = '1';
     await runLoop('', '', '');
   });
@@ -43,13 +82,14 @@ program
   .description('Show current configuration')
   .action(async () => {
     const config = await getConfig();
-    console.log('\n📋 Current Configuration:');
-    console.log(`  Provider: ${config.provider}`);
-    console.log(`  Model: ${config.model || '(not set)'}`);
-    console.log(`  Repo: ${config.repoUrl}`);
-    console.log(`  Branch: ${config.branch}`);
-    console.log(`  API Keys configured: ${Object.keys(config.apiKeys).filter(k => config.apiKeys[k]).join(', ') || 'none'}`);
-    console.log('');
+    tui.clearScreen();
+    tui.pushOutput('\n📋 Current Configuration:\n');
+    tui.pushOutput(`  Provider: ${config.provider}\n`);
+    tui.pushOutput(`  Model: ${config.model || '(not set)'}\n`);
+    tui.pushOutput(`  Repo: ${config.repoUrl}\n`);
+    tui.pushOutput(`  Branch: ${config.branch}\n`);
+    tui.pushOutput(`  API Keys configured: ${Object.keys(config.apiKeys).filter(k => config.apiKeys[k]).join(', ') || 'none'}\n`);
+    tui.pushOutput('\n');
   });
 
 program
@@ -58,10 +98,10 @@ program
   .action(async () => {
     const status = await verifyGitSetup();
     if (status) {
-      console.log('\n📋 Git Status:');
-      console.log(`  Remote: ${status.remoteUrl}`);
-      console.log(`  Branch: ${status.branch}`);
-      console.log(`  Status: ${status.status}`);
+      tui.pushOutput('\n📋 Git Status:\n');
+      tui.pushOutput(`  Remote: ${status.remoteUrl}\n`);
+      tui.pushOutput(`  Branch: ${status.ranch}\n`);
+      tui.pushOutput(`  Status: ${status.status}\n`);
     }
   });
 
@@ -69,16 +109,18 @@ program
   .command('git-push <message>')
   .description('Commit and push changes to GitHub')
   .action(async (message) => {
+    tui.pushOutput(`📤 Pushing: ${message}\n`);
     const success = await selfPush(message);
-    process.exit(success ? 0 : 1);
+    tui.pushOutput(success ? '✅ Pushed to GitHub\n' : '❌ Git push failed\n');
   });
 
 program
   .command('self-clone')
   .description('Clone own GitHub repo to tinc-self/ directory')
   .action(async () => {
+    tui.pushOutput('📦 Cloning self from GitHub...\n');
     const success = await selfClone();
-    process.exit(success ? 0 : 1);
+    tui.pushOutput(success ? '✅ Clone complete\n' : '❌ Clone failed\n');
   });
 
 program
@@ -90,11 +132,14 @@ program
     if (options.read) {
       const fs = await import('fs/promises');
       const content = await fs.readFile('memory.md', 'utf-8');
-      console.log(content);
+      tui.pushOutput(content);
     } else if (options.append) {
       await appendMemory(options.append);
-      console.log('Appended to memory.md');
+      tui.pushOutput('Appended to memory.md\n');
     }
   });
 
 program.parse();
+
+// Export status updater for use in loop.js
+export { syncStatus };

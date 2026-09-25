@@ -23,12 +23,14 @@ const MODEL_CONTEXT_LIMITS = {
 };
 
 const COMPACTION_THRESHOLD = 0.7;
+const CHARS_PER_TOKEN = 4; // Strict ratio
 
 function estimateTokens(text) {
-  return Math.ceil(text.length / 4);
+  return Math.ceil(text.length / CHARS_PER_TOKEN); // Strict 4:1 ratio
 }
 
 function getModelLimit(model) {
+  // Always use the configured limit, ignoring model-reported context window
   for (const [key, limit] of Object.entries(MODEL_CONTEXT_LIMITS)) {
     if (model.includes(key)) return limit;
   }
@@ -39,12 +41,14 @@ function compactContext(messages, model) {
   const limit = getModelLimit(model);
   const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   const estimatedTokens = estimateTokens(totalChars);
+  const pct = Math.round((estimatedTokens / limit) * 100);
   
-  if (estimatedTokens < limit * COMPACTION_THRESHOLD) {
-    return { messages, compacted: false, pct: Math.round(estimatedTokens/limit*100) };
+  // Trigger exactly at 70% threshold using strict ratio
+  if (pct < 70) {
+    return { messages, compacted: false, pct };
   }
   
-  console.log(`\n📝 Context at ${Math.round(estimatedTokens/limit*100)}% — compacting old messages...`);
+  console.log(`\n📝 Context at ${pct}% (${estimatedTokens}t / ${limit}t) — compacting old messages...`);
   
   const systemMsg = messages.find(m => m.role === 'system');
   const recentMessages = messages.slice(-10);
@@ -76,6 +80,36 @@ const SLASH_COMMANDS = {
   '/provider': 'Switch provider',
   '/help': 'Show available commands'
 };
+
+// Anti-Flaw Protocol: Track child processes for cleanup
+const activeChildren = new Set();
+
+// Clean up child processes on exit
+function cleanupChildren() {
+  if (activeChildren.size > 0) {
+    console.log(`\n🧹 Cleaning up ${activeChildren.size} child process(es)...`);
+    for (const child of activeChildren) {
+      try {
+        if (child && typeof child.kill === 'function') {
+          child.kill('SIGKILL');
+        }
+      } catch {}
+    }
+    activeChildren.clear();
+  }
+}
+
+process.on('exit', cleanupChildren);
+process.on('SIGINT', () => {
+  console.log('\n👋 Received SIGINT — cleaning up...');
+  cleanupChildren();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  console.log('\n👋 Received SIGTERM — cleaning up...');
+  cleanupChildren();
+  process.exit(0);
+});
 
 export async function runLoop(providerArg, modelArg, bootContent) {
   // Load config (with setup wizard if first run)
