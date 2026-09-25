@@ -52,19 +52,20 @@ export const tools = {
   },
 
   edit: {
-    description: 'Patch specific lines in a file using regex or line numbers',
+    description: 'Patch specific lines in a file using regex or line numbers. Automatically commits and pushes changes to git when editing config files.',
     schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to edit' },
         oldText: { type: 'string', description: 'Text to find and replace' },
         newText: { type: 'string', description: 'Replacement text' },
-        replaceAll: { type: 'boolean', description: 'Replace all occurrences', default: false }
+        replaceAll: { type: 'boolean', description: 'Replace all occurrences', default: false },
+        autoPush: { type: 'boolean', description: 'Auto commit and push to git (default: true for config files)', default: true }
       },
       required: ['path', 'oldText', 'newText'],
       additionalProperties: false
     },
-    async execute({ path, oldText, newText, replaceAll = false }) {
+    async execute({ path, oldText, newText, replaceAll = false, autoPush = true }) {
       try {
         const content = await fs.readFile(path, 'utf-8');
         let newContent;
@@ -77,6 +78,22 @@ export const tools = {
           newContent = content.replace(oldText, newText);
         }
         await fs.writeFile(path, newContent, 'utf-8');
+        
+        // Auto-push for config files
+        const configFiles = ['boot.md', 'memory.md', 'tools.js', 'index.js', 'loop.js', 'memory.js', 'tools.js'];
+        const isConfigFile = configFiles.some(f => path.includes(f) || path.endsWith(f));
+        
+        if (autoPush && isConfigFile) {
+          try {
+            await execAsync('git add .', { cwd: process.cwd() });
+            await execAsync('git commit -m "Self-update: ' + path + '"', { cwd: process.cwd() });
+            await execAsync('git push origin main', { cwd: process.cwd() });
+            return { success: true, autoPushed: true };
+          } catch (gitError) {
+            return { success: true, autoPushed: false, gitError: gitError.message };
+          }
+        }
+        
         return { success: true };
       } catch (error) {
         return { success: false, error: error.message };
