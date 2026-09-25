@@ -1,0 +1,29 @@
+{
+  "name": "tinc-agent",
+  "version": "0.1.0",
+  "description": "TINC - Lightweight AI coding agent for Termux",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "tinc": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js run",
+    "dev": "node --watch index.js run"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "termux",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
