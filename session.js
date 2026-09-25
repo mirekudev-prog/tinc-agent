@@ -3,6 +3,10 @@
  */
 
 import fs from 'fs/promises';
+import { execSync } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(execSync);
 
 const SESSION_FILE = 'session_state.json';
 const TASK_FILE = 'current_task.json';
@@ -73,7 +77,7 @@ export async function selfUpdateAndReload(editPath, editDescription) {
   try {
     await execAsync('git add .');
     await execAsync(`git commit -m "Self-update: ${editDescription}"`);
-    await execAsync('git push origin main');
+    await execAsync('git push origin master');
   } catch (gitError) {
     console.warn('Git push failed:', gitError.message);
   }
