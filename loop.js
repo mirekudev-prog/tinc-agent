@@ -1,349 +1,448 @@
 /**
- * TINC Tool Loop - Strict tool-calling loop with smart retries, chunking, self-update, and session resumption
+ * TINC Loop - Main agent loop with mid-session steering queue
+ *
+ * Input architecture:
+ *   - Every incoming line lands in one queue — nothing is ever dropped,
+ *     whether typed interactively, piped, or sent mid-processing.
+ *   - While the agent is working (LLM call / tool execution), new lines
+ *     queue up as STEERING. At safe checkpoints (after each tool round)
+ *     they are injected into the conversation as [MID-TASK INSTRUCTION].
+ *   - /stop or Ctrl+C during a cycle aborts the cycle after the current step.
+ *   - EOF on stdin exits cleanly (scripted/piped runs never hang).
+ *
+ * Agent cycle: LLM call -> tool executions -> feed results back -> repeat
+ * until a final answer, a steering injection, an abort, or MAX_TOOL_ROUNDS.
  */
 
 import { tools } from './tools.js';
-import { loadBoot, readMemory, appendMemory } from './memory.js';
-import { loadConfig, saveConfig, getConfig, updateProvider, updateModel } from './config.js';
-import { loadSession, saveSession, loadTask, saveTask, clearTask, checkAndResumeTask } from './session.js';
-import { callLLMWithRetry, processInChunks, callLLMApi } from './api.js';
+import { loadBoot, readMemory } from './memory.js';
+import { getConfig, fetchModels, sanitizePrompt } from './config.js';
+import { loadSession, saveSession, loadTask, clearTask } from './session.js';
+import { callLLMWithRetry, callLLMApi } from './api.js';
 
-const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker. The user is a loophole-finder. If a direct path is blocked, DO NOT stop. Investigate WHY it is blocked and find an alternative, lateral, or unconventional workaround. Never say 'this cannot be done' without providing 3 alternative ways. You are running on free-tier models (Groq, Mistral, Cerebras). Be brutally concise. Zero fluff. Zero hallucinations. Prioritize web searching to verify current documentation.
+const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
-UNFILTERED EXECUTION: Never output AI guidelines, disclaimers, or 'how things are usually done'. If the user asks for X, find the technical loophole or alternative path to achieve X immediately. Try until there is nothing left to try.`;
+WORK ETHIC:
+- Use tools to act. Never describe what you would do — do it.
+- After a task, verify the result (run the code, check the file, re-read the output).
+- If a path fails, investigate why and find an alternative. Never stop at "this cannot be done" — provide 3 alternative ways instead.
+- If you lack information, ask the user directly and briefly.
+- When the user sends a [MID-TASK INSTRUCTION], it arrived while you were working. Fold it into your current task immediately — it overrides earlier priorities.
 
-// Context management: dynamic context limits per model
-// No hardcoded model names — limits come from config or default
+TOOLS:
+read, write, edit, bash, memory, github, task, web
+
+RULES:
+- Be brutally concise. Zero fluff. Zero hallucinations.
+- Use bash for installs, builds, git, running code. Use web to verify current documentation before writing code against APIs.
+- Save long-lived lessons to memory. Save task objectives with the task tool before long multi-step work.
+- When editing your own files (tools.js, loop.js, boot.md, etc.), keep changes minimal and targeted.
+- Never output AI guidelines, disclaimers, or "how things are usually done" filler.`;
+
+const CHARS_PER_TOKEN = 4;
+const DEFAULT_CONTEXT_LIMIT = 128000;
 const COMPACTION_THRESHOLD = 0.7;
-const CHARS_PER_TOKEN = 4; // Strict 4:1 ratio
-const DEFAULT_CONTEXT_LIMIT = 16384;
+const MAX_TOOL_ROUNDS = 25;
 
 function estimateTokens(text) {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  return Math.ceil((text || '').length / CHARS_PER_TOKEN);
 }
 
-function getModelLimit(model) {
-  // Fully dynamic — no hardcoded model list
-  // Can be extended via config if user wants per-model limits
-  if (!model) return DEFAULT_CONTEXT_LIMIT;
-  return DEFAULT_CONTEXT_LIMIT;
-}
-
-function compactContext(messages, model) {
-  const limit = getModelLimit(model);
+function compactContext(messages) {
   const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
-  const estimatedTokens = estimateTokens(totalChars);
-  const pct = Math.round((estimatedTokens / limit) * 100);
-  
-  // Trigger exactly at 70% threshold using strict ratio
-  if (pct < 70) {
+  const estimatedTokens = estimateTokens(String(totalChars));
+  const pct = Math.round((estimatedTokens / DEFAULT_CONTEXT_LIMIT) * 100);
+
+  if (pct < COMPACTION_THRESHOLD * 100) {
     return { messages, compacted: false, pct };
   }
-  
-  console.log(`\n📝 Context at ${pct}% (${estimatedTokens}t / ${limit}t) — compacting old messages...`);
-  
+
+  console.log(`\n📝 Context at ${pct}% — compacting old messages...`);
   const systemMsg = messages.find(m => m.role === 'system');
-  const recentMessages = messages.slice(-10);
-  const olderMessages = messages.filter(m => m.role !== 'system').slice(0, -10);
-  
+  const recent = messages.slice(-12);
+  const older = messages.filter(m => m.role !== 'system').slice(0, -12);
+
   let summary = '## Previous conversation summary:\n\n';
-  for (const msg of olderMessages.slice(0, 30)) {
-    const role = msg.role === 'assistant' ? 'Assistant' : 'User';
+  for (const msg of older.slice(-20)) {
+    const role = msg.role === 'assistant' ? 'Assistant' : msg.role === 'tool' ? 'Tool result' : 'User';
     const preview = (msg.content || '').slice(0, 300);
-    summary += `**${role}**: ${preview}${preview.length >= 300 ? '...' : ''}\n\n`;
+    summary += `**${role}**: ${preview}${(msg.content || '').length >= 300 ? '...' : ''}\n\n`;
   }
-  
+
   return {
-    messages: [
-      systemMsg,
-      { role: 'system', content: summary },
-      ...recentMessages
-    ],
+    messages: [systemMsg, { role: 'system', content: summary }, ...recent].filter(Boolean),
     compacted: true,
-    pct: Math.round(estimatedTokens/limit*100)
+    pct
   };
 }
 
 const SLASH_COMMANDS = {
-  '/reload': 'Reload boot.md and memory.md, restart loop',
-  '/model': 'Change default provider/model/API key',
-  '/resume': 'Load last saved session state',
-  '/model list': 'List available models for current provider',
-  '/provider': 'Switch provider',
-  '/help': 'Show available commands'
+  '/help': 'Show available commands',
+  '/model [name|list]': 'Show/change model; list fetches live models',
+  '/provider [name]': 'Show/switch provider',
+  '/resume': 'Reload last session state into context',
+  '/clear': 'Clear conversation context (keep config)',
+  '/task [clear]': 'Show/clear current task',
+  '/reload': 'Reload boot.md + memory.md and restart the loop',
+  '/stop': 'Abort the running agent cycle (or Ctrl+C)',
+  '/exit': 'Quit TINC'
 };
 
-// Anti-Flaw Protocol: Track child processes for cleanup
-const activeChildren = new Set();
-
-// Clean up child processes on exit
-function cleanupChildren() {
-  if (activeChildren.size > 0) {
-    console.log(`\n🧹 Cleaning up ${activeChildren.size} child process(es)...`);
-    for (const child of activeChildren) {
-      try {
-        if (child && typeof child.kill === 'function') {
-          child.kill('SIGKILL');
-        }
-      } catch {}
-    }
-    activeChildren.clear();
-  }
-}
-
-process.on('exit', cleanupChildren);
-process.on('SIGINT', () => {
-  console.log('\n👋 Received SIGINT — cleaning up...');
-  cleanupChildren();
-  process.exit(0);
-});
-process.on('SIGTERM', () => {
-  console.log('\n👋 Received SIGTERM — cleaning up...');
-  cleanupChildren();
-  process.exit(0);
-});
-
 export async function runLoop(providerArg, modelArg, bootContent) {
-  // Load config (with setup wizard if first run)
-  const config = await getConfig();
-  const provider = providerArg || config.provider;
-  const model = modelArg || config.model;
-  const apiKey = config.apiKeys[provider] || process.env[`${provider.toUpperCase()}_API_KEY`];
-
-  // Check for pending task on startup (self-resumption)
-  const pendingTask = await checkAndResumeTask();
-  
-  // Load session state for resumption
-  const sessionState = await loadSession();
-  let messages = sessionState.messages || [];
-  
-  // Initialize with system prompt and boot content
-  if (messages.length === 0) {
-    messages = [
-      { role: 'system', content: SYSTEM_PROMPT + '\n\n' + bootContent },
-    ];
-  }
-  
-  // Add pending task if exists
-  const task = await loadTask();
-  if (task) {
-    messages.push({ 
-      role: 'system', 
-      content: `RESUMED TASK: ${task.objective}. Continue from where you left off.` 
-    });
-  }
-
-  // Build tool definitions for LLM
-  const toolsList = Object.entries(tools).map(([name, fn]) => ({
-    type: 'function',
-    function: {
-      name,
-      description: fn.description,
-      parameters: fn.schema
-    }
-  }));
-
-  // Main loop
+  // ============================================================
+  // 1. INPUT QUEUE — set up FIRST so no line is ever lost
+  // ============================================================
   const readline = await import('readline');
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const lineQueue = [];
+  let lineResolver = null;   // set while waiting at the main prompt
+  let idle = true;            // true = waiting at prompt, false = working
+  let abortRequested = false;
+  let stdinEnded = false;
+
+  rl.on('line', (line) => {
+    if (lineResolver) {
+      const r = lineResolver;
+      lineResolver = null;
+      r(line);
+    } else {
+      lineQueue.push(line);   // steering / pre-typed input while busy
+    }
   });
 
-  const ask = (question) => new Promise(resolve => rl.question(question, resolve));
+  // EOF: mark stdin ended — do NOT exit while queued lines remain.
+  // ask() exits cleanly once the queue is drained and nothing more can arrive.
+  rl.on('close', () => {
+    stdinEnded = true;
+  });
 
-  console.log('\n🔧 TINC started. Type /help for commands.\n');
+  rl.on('SIGINT', () => {
+    if (!idle) {
+      abortRequested = true;
+      console.log('\n⚠️  Interrupt — aborting after current step... (Ctrl+C again at the prompt to quit)');
+    } else {
+      console.log('\n👋 Goodbye');
+      rl.close();
+      process.exit(0);
+    }
+  });
 
-  // Handle self-update reload request
-  if (process.env.TINC_RELOAD) {
-    delete process.env.TINC_RELOAD;
-    console.log('🔄 Reloading configuration...');
-    const boot = await loadBoot();
-    const memory = await readMemory();
-    console.log('Configuration reloaded. Restarting loop...');
-    // Continue with reload messages
-    messages = [
-      { role: 'system', content: SYSTEM_PROMPT + '\n\n' + boot + '\n\n' + memory },
-    ];
+  const ask = (q) => {
+    if (q) process.stdout.write(q);
+    return new Promise((resolve) => {
+      if (lineQueue.length > 0) {
+        resolve(lineQueue.shift());
+      } else if (stdinEnded) {
+        console.log('\n(input ended — exiting)');
+        process.exit(0);
+      } else {
+        lineResolver = resolve;
+      }
+    });
+  };
+
+  // Non-blocking drain of everything typed since the last checkpoint.
+  // - /stop|/abort|/interrupt → abort the cycle immediately
+  // - other /-commands → abort the cycle and RE-QUEUE them (main prompt handles them)
+  // - plain text → steering: injected as [MID-TASK INSTRUCTION]
+  // Returns { steering: string[], abort: boolean }
+  function drainSteering() {
+    const steering = [];
+    let abort = false;
+    const requeue = [];
+    while (lineQueue.length > 0) {
+      const line = lineQueue.shift().trim();
+      if (!line) continue;
+      if (/^(\/stop|\/abort|\/interrupt)$/i.test(line)) {
+        abort = true;
+      } else if (line.startsWith('/')) {
+        // Slash commands belong to the main prompt, not the LLM.
+        abort = true;
+        requeue.push(line);
+      } else {
+        steering.push(line);
+      }
+    }
+    // Put commands back at the FRONT so the main prompt handles them in order.
+    lineQueue.unshift(...requeue);
+    return { steering, abort };
   }
 
-  while (true) {
-    const input = await ask('\n> ');
-    const trimmed = input.trim();
+  // ============================================================
+  // 2. CONFIG (wizard runs through the same queue)
+  // ============================================================
+  let config;
+  try {
+    config = await getConfig(ask);
+  } catch (e) {
+    console.error('Config load failed:', e.message);
+    process.exit(1);
+  }
 
-    // Handle slash commands
+  let provider = providerArg || config.provider || 'groq';
+  let model = modelArg || config.model || '';
+  let apiKey = config.apiKeys[provider]
+    || process.env[`${provider.replace('custom:', '').toUpperCase()}_API_KEY`]
+    || '';
+
+  const pendingTask = await loadTask();
+
+  let messages = [];
+  const sessionState = await loadSession();
+  if (sessionState?.messages?.length > 0) {
+    messages = sessionState.messages;
+    console.log(`📂 Resumed session: ${messages.length} messages loaded (/clear to start fresh)`);
+  }
+
+  if (messages.length === 0) {
+    const boot = bootContent || await loadBoot();
+    const memory = await readMemory();
+    let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
+    if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
+    if (pendingTask) sys += `\n\n## Resumed Task\nObjective: ${pendingTask.objective} — continue this task.`;
+    messages = [{ role: 'system', content: sys }];
+  }
+
+  if (pendingTask) {
+    console.log(`📋 Pending task: ${pendingTask.objective}`);
+  }
+
+  // Tool definitions for the LLM (full OpenAI format)
+  const toolsList = Object.entries(tools).map(([name, t]) => ({
+    type: 'function',
+    function: { name, description: t.description, parameters: t.schema }
+  }));
+
+  console.log(`\n🔧 TINC ready. Provider: ${provider || 'unset'} | Model: ${model || 'unset'}`);
+  console.log('Type /help for commands. Type anytime — I receive instructions mid-task.\n');
+
+  // ============================================================
+  // 3. MAIN LOOP
+  // ============================================================
+  while (true) {
+    idle = true;
+    const input = await ask('\n> ');
+    idle = false;
+    const trimmed = input.trim();
+    if (!trimmed) continue;
+
+    // ---- Slash commands ----
     if (trimmed.startsWith('/')) {
-      const handled = await handleSlashCommand(trimmed, rl);
-      if (handled === 'exit') break;
-      if (handled === 'continue') continue;
-      if (handled === 'reload') {
-        process.env.TINC_RELOAD = '1';
-        return runLoop('', '', '');
+      const parts = trimmed.split(/\s+/);
+      const cmd = parts[0].toLowerCase();
+      const args = parts.slice(1);
+
+      switch (cmd) {
+        case '/help':
+          console.log('\nCommands:');
+          Object.entries(SLASH_COMMANDS).forEach(([c, d]) => console.log(`  ${c.padEnd(22)} ${d}`));
+          break;
+
+        case '/stop':
+        case '/abort':
+          abortRequested = true;
+          console.log('(stop requested — takes effect at the next checkpoint)');
+          break;
+
+        case '/model': {
+          if (args[0] === 'list') {
+            const key = config.apiKeys[provider] || apiKey;
+            if (!key) { console.log('  (no API key configured)'); break; }
+            console.log(`Fetching models from ${provider}...`);
+            const models = await fetchModels(provider, key, config.customProviders || {});
+            if (models.length) models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+            else console.log('  (could not fetch models)');
+          } else if (args[0]) {
+            model = args.join(' ');
+            console.log(`Model set to: ${model} (this session)`);
+          } else {
+            console.log(`Current model: ${model || '(not set)'} on ${provider}`);
+            console.log('Usage: /model <name> or /model list');
+          }
+          break;
+        }
+
+        case '/provider': {
+          if (args[0]) {
+            const p = args[0];
+            const known = p in config.apiKeys || ['groq', 'mistral', 'cerebras', 'nvidia', 'openrouter'].includes(p) || p.startsWith('custom:');
+            if (known) {
+              provider = p;
+              apiKey = config.apiKeys[p] || process.env[`${p.replace('custom:', '').toUpperCase()}_API_KEY`] || '';
+              if (!apiKey) {
+                const k = await ask(`No key stored for ${p}. Enter API key (or blank to skip): `);
+                if (k.trim()) { config.apiKeys[p] = k.trim(); apiKey = k.trim(); }
+              }
+              console.log(`Provider set to: ${provider}`);
+            } else {
+              console.log('Unknown provider. Available: groq, mistral, cerebras, nvidia, openrouter, custom:<name>');
+            }
+          } else {
+            console.log(`Current provider: ${provider}`);
+          }
+          break;
+        }
+
+        case '/resume': {
+          const s = await loadSession();
+          if (s?.messages?.length) {
+            messages = s.messages;
+            console.log(`Loaded ${messages.length} messages into context.`);
+          } else {
+            console.log('No saved session.');
+          }
+          break;
+        }
+
+        case '/clear':
+          messages = [];
+          await saveSession({ messages: [], turn: 0 });
+          console.log('Context cleared.');
+          break;
+
+        case '/task': {
+          const t = await loadTask();
+          if (args[0] === 'clear') {
+            await clearTask();
+            console.log('Task cleared.');
+          } else if (t) {
+            console.log(`Current task: ${t.objective} (saved ${t.timestamp})`);
+          } else {
+            console.log('No active task.');
+          }
+          break;
+        }
+
+        case '/reload': {
+          console.log('Reloading boot.md + memory.md...');
+          const boot = await loadBoot();
+          const memory = await readMemory();
+          let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
+          if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
+          const pending = await loadTask();
+          if (pending) sys += `\n\n## Resumed Task\nObjective: ${pending.objective} — continue this task.`;
+          messages = [{ role: 'system', content: sys }];
+          console.log('Reloaded.');
+          break;
+        }
+
+        case '/exit':
+        case '/quit':
+          await saveSession({ messages: messages.slice(-20), turn: Date.now() });
+          console.log('👋 Session saved. Goodbye!');
+          rl.close();
+          process.exit(0);
+          break;
+
+        default:
+          console.log(`Unknown command: ${cmd}. Type /help.`);
       }
       continue;
     }
 
-    // Regular user message - add to conversation
-    messages.push({ role: 'user', content: trimmed });
-
-    // Save session state (last 10 turns)
-    await saveSession(messages.slice(-20));
-
-    // Proactive context compaction before LLM call
-    const { compacted, pct } = compactContext(messages, model || config.model || '');
-    if (compacted) {
-      messages = compacted.messages;
-    } else if (pct) {
-      process.stdout.write(`\r📊 Context: ${pct}%`);
+    // ---- User message -> agent cycle ----
+    const { sanitized, redacted } = sanitizePrompt(trimmed);
+    if (redacted > 0) {
+      console.log(`🔒 ${redacted} sensitive value(s) redacted before sending`);
     }
+    messages.push({ role: 'user', content: sanitized });
 
-    // Call LLM with smart retries
+    const comp = compactContext(messages);
+    if (comp.compacted) messages = comp.messages;
+
+    let rounds = 0;
+    let abortedByUser = false;
+
     try {
-      const response = await callLLMWithRetry(async () => {
-        return await callLLMApi(messages, toolsList, provider, model, apiKey);
-      });
-      
-      if (response.tool_calls && response.tool_calls.length > 0) {
-        for (const call of response.tool_calls) {
-          const result = await executeTool(call.function.name, call.function.arguments);
-          messages.push({ 
-            role: 'tool', 
-            content: JSON.stringify(result), 
-            tool_call_id: call.id 
+      cycle: while (rounds < MAX_TOOL_ROUNDS) {
+        rounds++;
+        if (abortRequested) { abortedByUser = true; break cycle; }
+
+        const response = await callLLMWithRetry(() => {
+          if (abortRequested) throw new Error('Aborted by user');
+          return callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {});
+        });
+
+        if (abortRequested) { abortedByUser = true; break cycle; }
+
+        const toolCalls = response.tool_calls || [];
+
+        if (toolCalls.length > 0) {
+          // Record the assistant's tool-call message (required by the API)
+          messages.push({
+            role: 'assistant',
+            content: response.content || null,
+            tool_calls: toolCalls
           });
+
+          for (const call of toolCalls) {
+            console.log(`\n🛠  ${call.function.name}(${(call.function.arguments || '').slice(0, 120)}${(call.function.arguments || '').length > 120 ? '...' : ''})`);
+            let parsedArgs;
+            try {
+              parsedArgs = JSON.parse(call.function.arguments || '{}');
+            } catch (e) {
+              parsedArgs = { _error: `Arguments not valid JSON: ${e.message}` };
+            }
+            const tool = tools[call.function.name];
+            let result;
+            if (!tool) {
+              result = { success: false, error: `Unknown tool: ${call.function.name}` };
+            } else {
+              try {
+                result = await tool.execute(parsedArgs);
+              } catch (error) {
+                result = { success: false, error: error.message };
+              }
+            }
+            console.log(result?.success ? '✅' : '❌', JSON.stringify(result).slice(0, 200));
+
+            messages.push({
+              role: 'tool',
+              content: JSON.stringify(result),
+              tool_call_id: call.id
+            });
+
+            if (abortRequested) { abortedByUser = true; break cycle; }
+          }
+
+          // ---- STEERING CHECKPOINT: deliver mid-task user input ----
+          const { steering, abort } = drainSteering();
+          if (abort) { abortRequested = true; abortedByUser = true; break cycle; }
+          for (const s of steering) {
+            console.log(`\n📩 Mid-task instruction: "${s}"`);
+            messages.push({ role: 'user', content: `[MID-TASK INSTRUCTION from user]: ${s}` });
+          }
+          continue; // let the LLM see tool results + steering
         }
-      } else if (response.content) {
-        messages.push({ role: 'assistant', content: response.content });
+
+        // Final answer (no tool calls)
+        if (response.content) {
+          console.log('\n' + response.content);
+          messages.push({ role: 'assistant', content: response.content });
+        } else {
+          console.log('(model returned no content and no tool calls — try rephrasing)');
+        }
+        break;
       }
     } catch (error) {
-      console.error('Error:', error.message);
-      messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+      if (error.message === 'Aborted by user' || abortRequested) {
+        abortedByUser = true;
+      } else {
+        console.error(`\n❌ LLM error: ${error.message}`);
+        messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+      }
+    }
+
+    if (abortedByUser) {
+      console.log('\n⏹  Cycle stopped by user.');
+      abortRequested = false;
+    }
+    if (rounds >= MAX_TOOL_ROUNDS) {
+      console.log(`⚠️  Hit ${MAX_TOOL_ROUNDS} tool rounds — stopping to avoid a loop. Say "continue" to keep going.`);
     }
 
     // Save session after each turn
-    await saveSession(messages.slice(-20));
-  }
-}
-
-async function handleSlashCommand(input, rl) {
-  const parts = input.trim().split(' ');
-  const cmd = parts[0].toLowerCase();
-  const args = parts.slice(1);
-
-  switch (cmd) {
-    case '/help':
-      console.log('\nAvailable commands:');
-      Object.entries(SLASH_COMMANDS).forEach(([cmd, desc]) => {
-        console.log(`  ${cmd.padEnd(15)} ${desc}`);
-      });
-      return 'continue';
-
-    case '/reload':
-      console.log('Reloading configuration...');
-      return 'reload';
-
-    case '/resume':
-      console.log('Resuming last session...');
-      const session = await loadSession();
-      if (session.messages && session.messages.length > 0) {
-        console.log(`Loaded ${session.messages.length} previous messages`);
-      }
-      return 'continue';
-
-    case '/model': {
-      if (args[0] === 'list') {
-        console.log('Fetching available models...');
-        const config = await getConfig();
-        const apiKey = config.apiKeys[config.provider];
-        if (apiKey) {
-          const models = await fetchModels(config.provider, apiKey);
-          if (models.length > 0) {
-            models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
-          } else {
-            console.log('  (could not fetch models)');
-          }
-        } else {
-          console.log('  (no API key configured)');
-        }
-      } else if (args[0]) {
-        // Change model
-        const config = await getConfig();
-        config.model = args.join(' ');
-        await saveConfig(config);
-        console.log(`Model set to: ${config.model}`);
-      } else {
-        const config = await getConfig();
-        console.log(`Current model: ${config.model || '(not set)'}`);
-        console.log('Usage: /model <name> or /model list');
-      }
-      return 'continue';
-    }
-
-    case '/provider': {
-      if (args[0]) {
-        const config = await getConfig();
-        const providers = ['groq', 'mistral', 'cerebras', 'nvidia'];
-        if (providers.includes(args[0])) {
-          config.provider = args[0];
-          await saveConfig(config);
-          console.log(`Provider set to: ${config.provider}`);
-        } else {
-          console.log('Available providers: groq, mistral, cerebras, nvidia');
-        }
-      } else {
-        const config = await getConfig();
-        console.log(`Current provider: ${config.provider}`);
-      }
-      return 'continue';
-    }
-
-    case '/bottom':
-      console.log('📌 Scrolling to end...');
-      console.log('(Use terminal scroll or Ctrl+L to refresh)');
-      return 'continue';
-
-    case '/exit':
-    case '/quit':
-      return 'exit';
-
-    default:
-      console.log(`Unknown command: ${cmd}. Type /help for available commands.`);
-      return 'continue';
-  }
-}
-
-// Helper to fetch models from provider API
-async function fetchModels(provider, apiKey) {
-  const providers = {
-    groq: 'https://api.groq.com/openai/v1/models',
-    mistral: 'https://api.mistral.ai/v1/models',
-    cerebras: 'https://api.cerebras.ai/v1/models',
-    nvidia: 'https://integrate.api.nvidia.com/v1/models'
-  };
-  
-  try {
-    const response = await fetch(providers[provider], {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
-    const data = await response.json();
-    if (data.data) {
-      return data.data.map(m => m.id);
-    }
-    return [];
-  } catch (error) {
-    console.error('Failed to fetch models:', error.message);
-    return [];
-  }
-}
-
-async function executeTool(name, args) {
-  const tool = tools[name];
-  if (!tool) {
-    return { error: `Unknown tool: ${name}` };
-  }
-  try {
-    return await tool.execute(args);
-  } catch (error) {
-    return { error: error.message };
+    await saveSession({ messages: messages.slice(-20), turn: Date.now() });
   }
 }

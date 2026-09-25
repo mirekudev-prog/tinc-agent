@@ -1,27 +1,58 @@
 /**
- * TINC Tools - Read, Write, Edit, Bash, Memory
- * Using only Node.js built-in modules
- * Auto-pushes to GitHub on self-edits
+ * TINC Tools - Read, Write, Edit, Bash, Memory, GitHub, Task, Web
+ * Node.js built-ins only. Auto-pushes to GitHub on self-edits.
  */
 
 import fs from 'fs/promises';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(os.homedir(), '.tinc');
+const MEMORY_FILE = path.join(DATA_DIR, 'memory.md');
+
+const SELF_FILES = ['boot.md', 'tools.js', 'index.js', 'loop.js', 'memory.js', 'config.js', 'api.js', 'session.js', 'tui.js', 'package.json'];
+
+async function ensureDataDir() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+}
+
+function run(cmd, opts = {}) {
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: 30000, maxBuffer: 10 * 1024 * 1024, ...opts }, (error, stdout, stderr) => {
+      resolve({ error: error ? error.message : null, stdout: stdout || '', stderr: stderr || '' });
+    });
+  });
+}
 
 export const tools = {
   read: {
-    description: 'Read file contents',
+    description: 'Read file contents (text). Use for code, configs, docs. For large files, use offset/limit.',
     schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path to read' }
+        path: { type: 'string', description: 'File path to read (relative to cwd or absolute)' },
+        offset: { type: 'number', description: 'Line number to start from (1-based, optional)' },
+        limit: { type: 'number', description: 'Max lines to read (optional)' }
       },
       required: ['path'],
       additionalProperties: false
     },
-    async execute({ path }) {
+    async execute({ path: p, offset, limit }) {
       try {
-        const content = await fs.readFile(path, 'utf-8');
-        return { success: true, content };
+        let content = await fs.readFile(p, 'utf-8');
+        if (offset || limit) {
+          const lines = content.split('\n');
+          const start = (offset ? offset - 1 : 0);
+          const end = limit ? start + limit : lines.length;
+          content = lines.slice(start, end)
+            .map((l, i) => `${start + i + 1}|${l}`)
+            .join('\n');
+        }
+        const stat = await fs.stat(p);
+        return { success: true, content, size: stat.size };
       } catch (error) {
         return { success: false, error: error.message };
       }
@@ -29,20 +60,21 @@ export const tools = {
   },
 
   write: {
-    description: 'Create or overwrite a file',
+    description: 'Create or overwrite a file with full content. For targeted changes to existing files, prefer edit.',
     schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to write' },
-        content: { type: 'string', description: 'Content to write' }
+        content: { type: 'string', description: 'Full content to write' }
       },
       required: ['path', 'content'],
       additionalProperties: false
     },
-    async execute({ path, content }) {
+    async execute({ path: p, content }) {
       try {
-        await fs.writeFile(path, content, 'utf-8');
-        return { success: true };
+        await fs.mkdir(path.dirname(p), { recursive: true });
+        await fs.writeFile(p, content, 'utf-8');
+        return { success: true, path: p, bytes: content.length };
       } catch (error) {
         return { success: false, error: error.message };
       }
@@ -50,47 +82,51 @@ export const tools = {
   },
 
   edit: {
-    description: 'Patch specific lines in a file using text replacement. Auto-commits and pushes to GitHub when editing self files.',
+    description: 'Replace a specific string in a file. oldText must match exactly (including whitespace). Set replaceAll for multiple occurrences. Auto-commits and pushes to GitHub when editing TINC self files.',
     schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to edit' },
-        oldText: { type: 'string', description: 'Text to find and replace' },
+        oldText: { type: 'string', description: 'Exact text to find' },
         newText: { type: 'string', description: 'Replacement text' },
-        replaceAll: { type: 'boolean', description: 'Replace all occurrences', default: false }
+        replaceAll: { type: 'boolean', description: 'Replace all occurrences (default false)' }
       },
       required: ['path', 'oldText', 'newText'],
       additionalProperties: false
     },
-    async execute({ path, oldText, newText, replaceAll = false }) {
-      const selfFiles = ['boot.md', 'memory.md', 'tools.js', 'index.js', 'loop.js', 'memory.js', 'config.js', 'api.js', 'session.js'];
-
+    async execute({ path: p, oldText, newText, replaceAll = false }) {
       try {
-        const content = await fs.readFile(path, 'utf-8');
-        let newContent;
-        if (replaceAll) {
-          newContent = content.split(oldText).join(newText);
-        } else {
-          if (!content.includes(oldText)) {
-            return { success: false, error: 'Text not found' };
-          }
-          newContent = content.replace(oldText, newText);
+        const content = await fs.readFile(p, 'utf-8');
+        if (!content.includes(oldText)) {
+          return { success: false, error: `oldText not found in ${p}` };
         }
-        await fs.writeFile(path, newContent, 'utf-8');
+        const count = content.split(oldText).length - 1;
+        if (!replaceAll && count > 1) {
+          return { success: false, error: `oldText appears ${count} times in ${p}. Make it unique or set replaceAll: true.` };
+        }
+        const newContent = replaceAll
+          ? content.split(oldText).join(newText)
+          : content.replace(oldText, newText);
 
-        // Auto-push to GitHub for self files
-        const isSelfFile = selfFiles.some(f => path.endsWith(f));
+        // Anti-Flaw: flag full overwrites
+        const changedRatio = newContent === content ? 0 : (newContent.length > 0 ? Math.abs(newContent.length - content.length) / Math.max(content.length, 1) : 1);
+        if (changedRatio > 0.8) {
+          return { success: false, error: `Full Overwrite Risk: this edit changes >80% of ${p}. Use write tool explicitly instead.` };
+        }
+
+        await fs.writeFile(p, newContent, 'utf-8');
+
+        // Auto-push for self files
+        const isSelfFile = SELF_FILES.some(f => p === f || p.endsWith('/' + f) || p === path.join(__dirname, f));
         if (isSelfFile) {
-          try {
-            execSync('git add .', { stdio: 'pipe' });
-            execSync(`git commit -m "Self-update: edit ${path}"`, { stdio: 'pipe' });
-            execSync('git push origin master', { stdio: 'pipe' });
-            return { success: true, pushed: true, message: 'Changes committed and pushed to GitHub' };
-          } catch (gitError) {
-            return { success: true, pushed: false, message: 'File updated but git push failed: ' + gitError.message };
+          const g = await run('git rev-parse --is-inside-work-tree 2>/dev/null');
+          if (!g.error) {
+            await run('git add .');
+            await run(`git commit -m "Self-update: edit ${p}"`);
+            const push = await run('git push origin master');
+            return { success: true, pushed: !push.error, pushError: push.error || undefined };
           }
         }
-
         return { success: true };
       } catch (error) {
         return { success: false, error: error.message };
@@ -99,51 +135,55 @@ export const tools = {
   },
 
   bash: {
-    description: 'Execute terminal commands and return stdout/stderr',
+    description: 'Execute a shell command and return stdout/stderr. 30s timeout. Use for builds, git, installs, running code.',
     schema: {
       type: 'object',
       properties: {
         command: { type: 'string', description: 'Command to execute' },
-        cwd: { type: 'string', description: 'Working directory (optional)' },
-        timeout: { type: 'number', description: 'Timeout in ms (default: 30000)' }
+        cwd: { type: 'string', description: 'Working directory (optional, default: process cwd)' },
+        timeout: { type: 'number', description: 'Timeout in ms (default 30000, max 120000)' }
       },
       required: ['command'],
       additionalProperties: false
     },
-    async execute({ command, cwd = process.cwd(), timeout = 30000 }) {
-      try {
-        const { stdout, stderr } = await execAsync(command, { cwd, timeout });
-        return { success: true, stdout, stderr };
-      } catch (error) {
-        return { success: false, error: error.message, stdout: error.stdout, stderr: error.stderr };
-      }
+    async execute({ command, cwd, timeout }) {
+      const result = await run(command, {
+        cwd: cwd || undefined,
+        timeout: Math.min(timeout || 30000, 120000)
+      });
+      return {
+        success: !result.error,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error || undefined
+      };
     }
   },
 
   memory: {
-    description: 'Read or append to persistent memory file',
+    description: 'Persistent memory across sessions. Read the whole file, or append a dated learning/preference/fact. Use append to store durable lessons.',
     schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['read', 'append'], description: 'Action to perform' },
-        content: { type: 'string', description: 'Content to append (for append action)' }
+        action: { type: 'string', enum: ['read', 'append'], description: 'read = whole file, append = add entry' },
+        content: { type: 'string', description: 'Entry text (append only)' }
       },
       required: ['action'],
       additionalProperties: false
     },
     async execute({ action, content }) {
-      const MEMORY_FILE = 'memory.md';
+      await ensureDataDir();
       try {
         if (action === 'read') {
-          const content = await fs.readFile('memory.md', 'utf-8');
-          return { success: true, content };
+          const c = await fs.readFile(MEMORY_FILE, 'utf-8').catch(() => '');
+          return { success: true, content: c || '(memory empty)' };
         } else if (action === 'append') {
+          if (!content) return { success: false, error: 'content required for append' };
           const timestamp = new Date().toISOString();
-          const entry = `\n## ${timestamp}\n${content}\n`;
-          await fs.appendFile('memory.md', entry, 'utf-8');
+          await fs.appendFile(MEMORY_FILE, `\n## ${timestamp}\n${content}\n`, 'utf-8');
           return { success: true };
         }
-        return { success: false, error: 'Invalid action' };
+        return { success: false, error: 'Invalid action. Use read or append.' };
       } catch (error) {
         return { success: false, error: error.message };
       }
@@ -151,16 +191,12 @@ export const tools = {
   },
 
   github: {
-    description: 'Self-update operations: clone own repo, check status, push changes',
+    description: 'Git operations on the current repo: status, push, clone, verify.',
     schema: {
       type: 'object',
       properties: {
-        action: { 
-          type: 'string', 
-          enum: ['status', 'push', 'clone', 'verify'], 
-          description: 'GitHub action to perform' 
-        },
-        message: { type: 'string', description: 'Commit message (for push action)' }
+        action: { type: 'string', enum: ['status', 'push', 'clone', 'verify'], description: 'Git action' },
+        message: { type: 'string', description: 'Commit message (for push)' }
       },
       required: ['action'],
       additionalProperties: false
@@ -169,30 +205,32 @@ export const tools = {
       try {
         switch (action) {
           case 'status': {
-            const remote = execSync('git remote get-url origin', { encoding: 'utf-8' }).trim();
-            const branch = execSync('git branch --show-current', { encoding: 'utf-8' }).trim();
-            const status = execSync('git status --short', { encoding: 'utf-8' }).trim() || 'clean';
-            return { success: true, remote, branch, status };
+            const remote = await run('git remote get-url origin');
+            const branch = await run('git branch --show-current');
+            const status = await run('git status --short');
+            return {
+              success: true,
+              remote: remote.stdout.trim() || null,
+              branch: branch.stdout.trim() || null,
+              status: status.stdout.trim() || 'clean'
+            };
           }
           case 'push': {
             if (!message) return { success: false, error: 'Commit message required' };
-            execSync('git add .', { stdio: 'pipe' });
-            execSync(`git commit -m "${message}"`, { stdio: 'pipe' });
-            execSync('git push origin master', { stdio: 'pipe' });
-            return { success: true, message: 'Pushed to GitHub' };
+            const add = await run('git add .');
+            if (add.error) return { success: false, error: 'git add failed: ' + add.error };
+            const commit = await run(`git commit -m "${message.replace(/"/g, '\\"')}"`);
+            if (commit.error) return { success: false, error: 'git commit failed: ' + commit.error, stderr: commit.stderr };
+            const push = await run('git push origin master');
+            return { success: !push.error, error: push.error || undefined, stderr: push.stderr };
           }
           case 'clone': {
-            const { execSync: exec } = await import('child_process');
-            exec('git clone https://github.com/mirekudev-prog/tinc-agent.git tinc-self', { stdio: 'pipe' });
-            return { success: true, message: 'Cloned self to tinc-self/' };
+            const clone = await run('git clone https://github.com/mirekudev-prog/tinc-agent.git tinc-self');
+            return { success: !clone.error, error: clone.error || undefined };
           }
           case 'verify': {
-            try {
-              const remote = execSync('git remote get-url origin', { encoding: 'utf-8' }).trim();
-              return { success: true, remote };
-            } catch {
-              return { success: false, error: 'Not a git repo or no remote' };
-            }
+            const v = await run('git rev-parse --is-inside-work-tree');
+            return { success: !v.error, error: v.error ? 'Not a git repo' : undefined };
           }
           default:
             return { success: false, error: 'Unknown action' };
@@ -204,43 +242,71 @@ export const tools = {
   },
 
   task: {
-    description: 'Save/load/clear current task for self-resumption across reloads',
+    description: 'Save/load/clear the current task objective so work survives restarts. Save before long tasks; clear when done.',
     schema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['save', 'load', 'clear'], description: 'Task action' },
-        objective: { type: 'string', description: 'Task objective (for save)' }
+        objective: { type: 'string', description: 'Task objective (save only)' }
       },
       required: ['action'],
       additionalProperties: false
     },
     async execute({ action, objective }) {
+      await ensureDataDir();
+      const taskFile = path.join(DATA_DIR, 'current_task.json');
       try {
         if (action === 'save') {
           if (!objective) return { success: false, error: 'Objective required' };
-          await fs.writeFile('current_task.json', JSON.stringify({
+          await fs.writeFile(taskFile, JSON.stringify({
             objective,
             timestamp: new Date().toISOString(),
             status: 'in_progress'
           }, null, 2), 'utf-8');
           return { success: true, message: 'Task saved' };
         } else if (action === 'load') {
-          const content = await fs.readFile('current_task.json', 'utf-8');
-          return { success: true, task: JSON.parse(content) };
+          const c = await fs.readFile(taskFile, 'utf-8').catch(() => null);
+          if (!c) return { success: false, error: 'No saved task' };
+          return { success: true, task: JSON.parse(c) };
         } else if (action === 'clear') {
-          await fs.unlink('current_task.json');
+          await fs.unlink(taskFile).catch(() => {});
           return { success: true, message: 'Task cleared' };
         }
       } catch (error) {
-        if (error.code === 'ENOENT' && action === 'load') {
-          return { success: false, error: 'No saved task' };
+        return { success: false, error: error.message };
+      }
+    }
+  },
+
+  web: {
+    description: 'Fetch a URL and return response body (text). Use for docs, APIs, and raw pages. For search, use the user render search endpoint or duckduckgo html.',
+    schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to fetch' },
+        maxChars: { type: 'number', description: 'Max characters to return (default 8000)' }
+      },
+      required: ['url'],
+      additionalProperties: false
+    },
+    async execute({ url: u, maxChars = 8000 }) {
+      try {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 20000);
+        const response = await fetch(u, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Linux; Android 14) TINC/0.2.0' }
+        });
+        clearTimeout(t);
+        const status = response.status;
+        let body = await response.text();
+        if (body.length > maxChars) {
+          body = body.slice(0, maxChars) + `\n...[truncated, ${body.length} total chars]`;
         }
+        return { success: status < 400, status, body };
+      } catch (error) {
         return { success: false, error: error.message };
       }
     }
   }
 };
-
-// Bash needs execAsync - define here for tools.js standalone use
-import { promisify } from 'util';
-const execAsync = promisify(execSync);

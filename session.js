@@ -1,106 +1,67 @@
 /**
- * TINC Session Manager - Session resumption and state persistence
+ * TINC Session Manager - Session state and task persistence
+ * All state lives in ~/.tinc (outside the repo).
  */
 
 import fs from 'fs/promises';
-import { execSync } from 'child_process';
-import { promisify } from 'util';
+import os from 'os';
+import path from 'path';
 
-const execAsync = promisify(execSync);
+const DATA_DIR = path.join(os.homedir(), '.tinc');
+const SESSION_FILE = path.join(DATA_DIR, 'session_state.json');
+const TASK_FILE = path.join(DATA_DIR, 'current_task.json');
 
-const SESSION_FILE = 'session_state.json';
-const TASK_FILE = 'current_task.json';
+async function ensureDir() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+}
 
 export async function loadSession() {
   try {
-    const content = await fs.readFile('session_state.json', 'utf-8');
+    const content = await fs.readFile(SESSION_FILE, 'utf-8');
     return JSON.parse(content);
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      return { messages: [], turn: 0 };
-    }
-    throw error;
+    if (error.code === 'ENOENT') return { messages: [], turn: 0 };
+    return { messages: [], turn: 0 };
   }
 }
 
-export async function saveSession(messages) {
-  const session = {
-    messages,
-    turn: Date.now()
-  };
-  await fs.writeFile('session_state.json', JSON.stringify(session, null, 2), 'utf-8');
+export async function saveSession(session) {
+  await ensureDir();
+  await fs.writeFile(SESSION_FILE, JSON.stringify(session, null, 2), 'utf-8');
 }
 
 export async function loadTask() {
   try {
-    const content = await fs.readFile('current_task.json', 'utf-8');
+    const content = await fs.readFile(TASK_FILE, 'utf-8');
     return JSON.parse(content);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return null;
-    }
-    throw error;
+  } catch {
+    return null;
   }
 }
 
 export async function saveTask(task) {
+  await ensureDir();
   if (task) {
-    await fs.writeFile('current_task.json', JSON.stringify(task, null, 2), 'utf-8');
+    await fs.writeFile(TASK_FILE, JSON.stringify(task, null, 2), 'utf-8');
   } else {
-    try {
-      await fs.unlink('current_task.json');
-    } catch {}
+    await clearTask();
   }
 }
 
 export async function clearTask() {
   try {
-    await fs.unlink('current_task.json');
+    await fs.unlink(TASK_FILE);
   } catch {}
 }
 
 /**
- * Self-update sequence - saves current task, applies edits, commits, pushes, reloads
- */
-export async function selfUpdateAndReload(editPath, editDescription) {
-  // a) Save current objective/task
-  const task = {
-    timestamp: new Date().toISOString(),
-    description: editDescription,
-    objective: 'Self-update in progress'
-  };
-  await fs.writeFile('current_task.json', JSON.stringify(task, null, 2), 'utf-8');
-  
-  // b) Apply edits (already done by caller via edit tool)
-  
-  // c) Commit and push
-  try {
-    await execAsync('git add .');
-    await execAsync(`git commit -m "Self-update: ${editDescription}"`);
-    await execAsync('git push origin master');
-  } catch (gitError) {
-    console.warn('Git push failed:', gitError.message);
-  }
-  
-  // d) Trigger reload
-  console.log('Reloading...');
-  
-  // The reload will happen when the loop restarts
-  // We can signal this by throwing a special error or setting a flag
-  throw new Error('RELOAD_REQUESTED');
-}
-
-/**
- * Check for pending task on startup and resume if found
+ * Check for pending task on startup and return it for injection into context.
  */
 export async function checkAndResumeTask() {
-  const task = await fs.readFile('current_task.json', 'utf-8').catch(() => null);
-  if (task) {
-    try {
-      const taskData = JSON.parse(task);
-      console.log('📋 Resuming task:', taskData.description);
-      return taskData;
-    } catch {}
+  const task = await loadTask();
+  if (task?.objective) {
+    console.log(`📋 Resuming task: ${task.objective}`);
+    return task;
   }
   return null;
 }
