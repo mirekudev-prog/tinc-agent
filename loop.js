@@ -14,6 +14,9 @@
  * until a final answer, a steering injection, an abort, or MAX_TOOL_ROUNDS.
  */
 
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { tools } from './tools.js';
 import { loadBoot, readMemory } from './memory.js';
 import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
@@ -22,6 +25,8 @@ import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from '.
 import { createCompleter } from './completer.js';
 import { observeTurn } from './memory-worker.js';
 import { selectFromList } from './selector.js';
+
+const DATA_DIR = path.join(os.homedir(), '.tinc');
 
 const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
@@ -107,11 +112,64 @@ function compactContext(messages) {
 }
 
 // ============================================================
-// MODEL METADATA — live context window per model (no hardcoding)
+// MODEL METADATA — live context window (the proper way)
 // ============================================================
-// Fetches /v1/models/:id and reads max_context_window / context_length
-// fields (NVIDIA NIM exposes max_context_window). Falls back to 128k
-// when the field is missing, and caches per model for the session.
+// Resolution order:
+//   1. Manual/learned limit persisted in config (user override, overflow-learned)
+//   2. models.dev registry — community-maintained live catalog of every
+//      provider's models with real context limits (what OpenCode uses).
+//      Cached for 24h in ~/.tinc/.models_dev_cache.json
+//   3. Provider /models/:id metadata (OpenRouter exposes it; NVIDIA doesn't)
+//   4. 128k fallback
+
+const MODELS_DEV_URL = 'https://models.dev/api.json';
+let modelsDevCache = null;       // in-memory
+let modelsDevFetchedAt = 0;
+
+async function loadModelsDev(force = false) {
+  if (!force && modelsDevCache && (Date.now() - modelsDevFetchedAt) < 24 * 3600 * 1000) {
+    return modelsDevCache;
+  }
+  // Disk cache (24h TTL) so sessions work offline too
+  const cacheFile = path.join(DATA_DIR, '.models_dev_cache.json');
+  try {
+    if (!force) {
+      const disk = JSON.parse(await fs.readFile(cacheFile, 'utf-8'));
+      if (disk.fetchedAt && (Date.now() - disk.fetchedAt) < 24 * 3600 * 1000) {
+        modelsDevCache = disk.data;
+        modelsDevFetchedAt = disk.fetchedAt;
+        return modelsDevCache;
+      }
+    }
+  } catch {}
+  try {
+    const r = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(30000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    modelsDevCache = data;
+    modelsDevFetchedAt = Date.now();
+    try {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      await fs.writeFile(cacheFile, JSON.stringify({ fetchedAt: modelsDevFetchedAt, data }, null, 0), 'utf-8');
+    } catch {}
+    return data;
+  } catch {
+    return modelsDevCache; // stale is better than nothing
+  }
+}
+
+async function lookupModelsDev(provider, model) {
+  const data = await loadModelsDev();
+  if (!data) return null;
+  // Providers in the registry are keyed by their own id (nvidia, groq...)
+  const prov = data[provider === 'nvidia' ? 'nvidia' : provider];
+  let m = prov?.models?.[model];
+  // Model ids on the wire sometimes carry the provider prefix, registry keys may not
+  if (!m && model.includes('/')) {
+    m = prov?.models?.[model.split('/').slice(1).join('/')];
+  }
+  return m || null;
+}
 
 const modelMetaCache = new Map();
 
@@ -119,26 +177,40 @@ export async function getModelContextLimit(provider, model, apiKey, customProvid
   const cacheKey = `${provider}::${model}`;
   if (modelMetaCache.has(cacheKey)) return modelMetaCache.get(cacheKey);
 
-  let limit = 128000;
+  let limit = null;
+
+  // 2. models.dev registry — the authoritative community catalog
   try {
-    const baseUrl = resolveBaseUrl(provider, customProviders);
-    if (baseUrl) {
-      const url = `${baseUrl.replace(/\/+$/, '')}/models/${encodeURIComponent(model)}`;
-      const r = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(15000)
-      });
-      if (r.ok) {
-        const d = await r.json();
-        const m = d.data || d;
-        const raw = m.max_context_window ?? m.context_length ?? m.max_model_len ?? m.context_window;
-        if (typeof raw === 'number' && raw > 0) limit = raw;
-        else if (Array.isArray(m.context_length)) limit = Math.max(...m.context_length);
-      }
-    }
+    const m = await lookupModelsDev(provider, model);
+    const ctx = m?.limit?.context;
+    if (typeof ctx === 'number' && ctx > 0) limit = ctx;
   } catch {}
-  modelMetaCache.set(cacheKey, limit);
-  return limit;
+
+  // 3. Provider /models/:id metadata (only some providers expose it)
+  if (!limit) {
+    try {
+      const baseUrl = resolveBaseUrl(provider, customProviders);
+      if (baseUrl) {
+        const url = `${baseUrl.replace(/\/+$/, '')}/models/${model}`;
+        const r = await fetch(url, {
+          headers: { 'Authorization': `Bearer ${apiKey}` },
+          signal: AbortSignal.timeout(15000)
+        });
+        if (r.ok) {
+          const d = await r.json();
+          const m = d.data || d;
+          const raw = m.max_context_window ?? m.context_length ?? m.max_model_len ?? m.context_window;
+          if (typeof raw === 'number' && raw > 0) limit = raw;
+          else if (Array.isArray(m.context_length)) limit = Math.max(...m.context_length);
+        }
+      }
+    } catch {}
+  }
+
+  // 4. Fallback
+  const result = limit || 128000;
+  modelMetaCache.set(cacheKey, result);
+  return result;
 }
 
 // ============================================================
@@ -471,9 +543,14 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             model = picked;
             config.model = model;
             await saveConfig(config);
-            // Update live context limit for the new model
+            // Update live context limit for the new model + reset usage tracking
+            modelMetaCache.delete(`${provider}::${model}`);
+            lastPromptTokens = null;
+            lastTotalTokens = null;
             try {
-              CONTEXT_LIMIT = await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+              const learned = config.learnedLimits?.[`${provider}::${model}`];
+              CONTEXT_LIMIT = learned || await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+              console.log(`📐 Context limit for ${model}: ${Math.round(CONTEXT_LIMIT / 1000)}k`);
             } catch {}
             console.log(`✅ Model set to: ${model} (saved)`);
           } else if (args[0] === 'refresh') {
