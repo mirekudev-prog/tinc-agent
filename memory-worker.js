@@ -176,6 +176,49 @@ async function extractBatch(turns, config) {
   return appendEntries(entries);
 }
 
+// ---------- STATUS (for /memory command in the main loop) ----------
+
+export async function memoryWorkerStatus() {
+  const config = await loadConfig();
+  const mw = config.memoryWorker || {};
+  const enabled = mw.enabled !== false;
+  const provider = mw.provider || 'groq';
+  const hasKey = !!(config.apiKeys?.[provider] || process.env[`${provider.toUpperCase()}_API_KEY`]);
+  const turns = await loadBuffer();
+
+  // Count memory entries by type
+  const memory = await fs.readFile(MEMORY_FILE, 'utf-8').catch(() => '');
+  const counts = {};
+  const lines = memory.split('\n');
+  let currentType = 'unknown';
+  let total = 0;
+  for (const l of lines) {
+    const m = l.match(/^## .* — (\w+)/);
+    if (m) { currentType = m[1]; counts[currentType] = (counts[currentType] || 0) + 1; total++; }
+  }
+
+  return {
+    enabled,
+    provider,
+    model: resolvedModel || mw.model || '(auto-resolving)',
+    hasKey,
+    bufferedTurns: turns.length,
+    batchSize: BATCH_SIZE,
+    totalEntries: total,
+    counts,
+    memoryFile: MEMORY_FILE
+  };
+}
+
+export async function setWorkerModel(provider, model) {
+  const config = await loadConfig();
+  config.memoryWorker = { ...(config.memoryWorker || {}), provider, model, enabled: true };
+  await saveConfig(config);
+  resolvedModel = model;
+}
+
+export const WORKER_BATCH_SIZE = BATCH_SIZE;
+
 // ---------- MAIN ENTRY ----------
 
 /**

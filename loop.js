@@ -23,7 +23,7 @@ import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js'
 import { loadSession, saveSession, createSession, listSessions, renameSession, deleteSession, loadTask, clearTask } from './session.js';
 import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from './api.js';
 import { createCompleter } from './completer.js';
-import { observeTurn } from './memory-worker.js';
+import { observeTurn, memoryWorkerStatus, setWorkerModel } from './memory-worker.js';
 import { selectFromList } from './selector.js';
 
 const DATA_DIR = path.join(os.homedir(), '.tinc');
@@ -257,6 +257,7 @@ const SLASH_COMMANDS = {
   '/resume': 'Reload last session state into context',
   '/clear': 'Clear conversation context (keep config)',
   '/task [clear]': 'Show/clear current task',
+  '/memory': 'Memory worker status; /memory model [provider] to change its model; /memory on|off',
   '/reload': 'Restart TINC process (fresh code) and resume this session',
   '/stop': 'Abort the running agent cycle (or Ctrl+C)',
   '/login': 'Change provider/model/API key interactively',
@@ -633,6 +634,65 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           } else {
             console.log(`Current provider: ${provider}`);
           }
+          break;
+        }
+
+        case '/memory': {
+          const st = await memoryWorkerStatus();
+
+          if (args[0] === 'model') {
+            // Change the memory worker's model (and optionally provider)
+            const provArg2 = args[1];
+            let prov = st.provider;
+            if (provArg2 && ['groq', 'mistral', 'cerebras', 'nvidia', 'openrouter'].includes(provArg2)) {
+              prov = provArg2;
+            }
+            const key = config.apiKeys?.[prov] || process.env[`${prov.toUpperCase()}_API_KEY`] || '';
+            if (!key) { console.log(`No key stored for ${prov}.`); break; }
+            const models = await fetchModels(prov, key, config.customProviders || {});
+            if (!models.length) { console.log('Could not fetch models.'); break; }
+            const chat = models.filter(m => !/whisper|orpheus|prompt-guard|safeguard|tts/i.test(m));
+            const items = chat.map(m => ({
+              label: m,
+              hint: m === st.model ? 'current worker model' : ''
+            }));
+            const sel = await selectFromList(`Memory worker model (${prov})`, items, {
+              startIndex: Math.max(0, chat.indexOf(st.model)),
+              suspendRl: rl
+            });
+            let picked = null;
+            if (sel >= 0) picked = chat[sel];
+            else if (sel === -2) {
+              const c = (await ask('Model (number or name): ')).trim();
+              if (c) picked = chat[parseInt(c) - 1] || (chat.includes(c) ? c : null);
+            }
+            if (!picked) { if (sel !== -1) console.log('(no selection)'); break; }
+            await setWorkerModel(prov, picked);
+            console.log(`✅ Memory worker model: ${prov}/${picked} (global — saved)`);
+            break;
+          }
+
+          if (args[0] === 'on' || args[0] === 'off') {
+            const on = args[0] === 'on';
+            config.memoryWorker = { ...(config.memoryWorker || {}), enabled: on };
+            await saveConfig(config);
+            console.log(`Memory worker ${on ? 'enabled' : 'disabled'}.`);
+            break;
+          }
+
+          // STATUS VIEW
+          const on = st.enabled ? '\x1b[92mON\x1b[0m' : '\x1b[91mOFF\x1b[0m';
+          console.log(`\n\x1b[1m🧠 Memory Worker\x1b[0m  ${on}`);
+          console.log(`  Model:    \x1b[94m${st.provider}/${st.model}\x1b[0m${st.hasKey ? '' : ' \x1b[91m(no API key!)\x1b[0m'}`);
+          console.log(`  Progress: ${st.bufferedTurns}/${st.batchSize} turns buffered → next extraction batch`);
+          console.log(`  Memory:   ${st.totalEntries} entries` +
+            (Object.keys(st.counts).length ? ` (${Object.entries(st.counts).map(([t, n]) => `${t}: ${n}`).join(', ')})` : ''));
+          if (st.totalEntries > 0 || st.bufferedTurns > 0) {
+            console.log(`  File:     ${st.memoryFile}`);
+          }
+          console.log('\n  /memory model [provider] — change worker model (picker)');
+          console.log('  /memory on | off — toggle');
+          console.log('  (worker runs 1 extraction call per 10 turns, in background)');
           break;
         }
 
