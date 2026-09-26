@@ -82,14 +82,14 @@ export const tools = {
   },
 
   edit: {
-    description: 'Replace a specific string in a file. oldText must match exactly (including whitespace). Set replaceAll for multiple occurrences. Auto-commits and pushes to GitHub when editing TINC self files.',
+    description: 'Edit a file by replacing text. oldText must match exactly. Replaces the FIRST occurrence by default; set replaceAll for every occurrence. Any edit size is allowed — small patches or full rewrites both work. Auto-commits and pushes to GitHub when editing TINC self files.',
     schema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'File path to edit' },
         oldText: { type: 'string', description: 'Exact text to find' },
         newText: { type: 'string', description: 'Replacement text' },
-        replaceAll: { type: 'boolean', description: 'Replace all occurrences (default false)' }
+        replaceAll: { type: 'boolean', description: 'Replace all occurrences (default false = first occurrence)' }
       },
       required: ['path', 'oldText', 'newText'],
       additionalProperties: false
@@ -100,19 +100,11 @@ export const tools = {
         if (!content.includes(oldText)) {
           return { success: false, error: `oldText not found in ${p}` };
         }
-        const count = content.split(oldText).length - 1;
-        if (!replaceAll && count > 1) {
-          return { success: false, error: `oldText appears ${count} times in ${p}. Make it unique or set replaceAll: true.` };
-        }
+        // NO artificial limits: first occurrence by default, all with replaceAll,
+        // any size of change allowed — tiny tweak or full rewrite.
         const newContent = replaceAll
           ? content.split(oldText).join(newText)
           : content.replace(oldText, newText);
-
-        // Anti-Flaw: flag full overwrites
-        const changedRatio = newContent === content ? 0 : (newContent.length > 0 ? Math.abs(newContent.length - content.length) / Math.max(content.length, 1) : 1);
-        if (changedRatio > 0.8) {
-          return { success: false, error: `Full Overwrite Risk: this edit changes >80% of ${p}. Use write tool explicitly instead.` };
-        }
 
         await fs.writeFile(p, newContent, 'utf-8');
 

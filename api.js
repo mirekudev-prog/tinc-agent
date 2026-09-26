@@ -13,7 +13,9 @@ import { PROVIDERS } from './config.js';
 export const RETRY_DELAYS = [2000, 5000, 10000, 20000, 40000, 60000, 90000, 120000, 180000, 240000];
 
 // ============================================================
-// SHARED RATE METER — provider RPM budget, paced across calls
+// RATE METER — shared budgets. Main agent and memory worker both draw
+// from the provider pool; Groq stays available for the always-on worker
+// because the worker only fires every 10 turns (cheap, batched).
 // ============================================================
 // Every call records a timestamp. Before a new call, we ensure the
 // rolling 60s window respects the provider's requests-per-minute
@@ -151,8 +153,185 @@ export function resolveBaseUrl(provider, customProviders = {}) {
 }
 
 // ============================================================
-// REAL LLM API CALL
+// STREAMING CALL — reasoning in a separated container
 // ============================================================
+
+/**
+ * Stream a chat completion. Renders:
+ *   - reasoning_content (nemotron/o1-style thinking) inside a dim box
+ *   - content (the actual answer) as plain output, live as it arrives
+ * Returns { content, tool_calls, finish_reason, usage } like callLLMApi.
+ */
+export async function callLLMStreaming(messages, toolsList, provider, model, apiKey, customProviders = {}, onChunk = null) {
+  const baseUrl = resolveBaseUrl(provider, customProviders);
+  if (!baseUrl) throw new Error(`Unknown provider: ${provider}`);
+  if (!model) throw new Error('No model selected. Use /model to set one.');
+  if (!apiKey) throw new Error(`No API key for ${provider}.`);
+
+  await waitForRpmSlot(provider);
+  await enforceMinGap(provider);
+
+  const url = baseUrl.replace(/\/+$/, '') + '/chat/completions';
+  console.log(`\n🤖 ${provider}/${model}...`);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream'
+    },
+    body: JSON.stringify({
+      model: model,
+      messages: messages,
+      tools: toolsList.length > 0 ? toolsList : undefined,
+      temperature: 0.7,
+      max_tokens: 16384,         // no artificial cap; auto-continue handles longer
+      stream: true,
+      stream_options: { include_usage: true }
+    }),
+    signal: AbortSignal.timeout(300000)
+  }).catch(err => {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      const e = new Error('Streaming request timed out after 300s');
+      e.code = 'ETIMEDOUT';
+      throw e;
+    }
+    throw err;
+  });
+
+  if (!response.ok) {
+    let errorBody = '';
+    try { errorBody = await response.text(); } catch {}
+    const error = new Error(`LLM API error: ${response.status} ${response.statusText}${errorBody ? ' — ' + errorBody.slice(0, 500) : ''}`);
+    error.status = response.status;
+    const retryAfter = response.headers.get('retry-after');
+    if (retryAfter) {
+      const secs = parseFloat(retryAfter);
+      if (!isNaN(secs)) error.retryAfterMs = secs * 1000;
+    }
+    const bodyMatch = errorBody && errorBody.match(/try again in ([\d.]+)s/i);
+    if (bodyMatch) {
+      const secs = parseFloat(bodyMatch[1]);
+      if (!isNaN(secs)) error.retryAfterMs = Math.max(error.retryAfterMs || 0, secs * 1000);
+    }
+    throw error;
+  }
+
+  // ---- SSE stream parsing ----
+  let content = '';
+  let reasoning = '';
+  let toolCalls = [];          // aggregated: {index, id, name, args}
+  let finishReason = null;
+  let usage = { promptTokens: null, completionTokens: null, totalTokens: null };
+
+  let inReasoningBox = false;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const ensureReasoningBox = () => {
+    if (!inReasoningBox) {
+      process.stdout.write('\n\x1b[2m┌─ thinking' + '─'.repeat(30) + '\x1b[0m\n');
+      inReasoningBox = true;
+    }
+  };
+  const closeReasoningBox = () => {
+    if (inReasoningBox) {
+      process.stdout.write('\n\x1b[2m└' + '─'.repeat(39) + '\x1b[0m\n\n');
+      inReasoningBox = false;
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === '[DONE]') continue;
+
+        let delta;
+        try {
+          delta = JSON.parse(payload);
+        } catch { continue; }
+
+        if (delta.usage) {
+          usage.promptTokens = delta.usage.prompt_tokens ?? usage.promptTokens;
+          usage.completionTokens = delta.usage.completion_tokens ?? usage.completionTokens;
+          usage.totalTokens = delta.usage.total_tokens ?? usage.totalTokens;
+        }
+
+        const d = delta.choices?.[0]?.delta;
+        if (!d) continue;
+        if (delta.choices?.[0]?.finish_reason) finishReason = delta.choices[0].finish_reason;
+
+        // Reasoning stream → dim box (keeps it visually separate)
+        const rChunk = d.reasoning_content || d.reasoning;
+        if (rChunk) {
+          ensureReasoningBox();
+          process.stdout.write('\x1b[2m' + rChunk + '\x1b[0m');
+          reasoning += rChunk;
+        }
+
+        // Answer stream → normal text, closes the box first
+        if (d.content) {
+          closeReasoningBox();
+          process.stdout.write(d.content);
+          content += d.content;
+          if (onChunk) onChunk(d.content);
+        }
+
+        // Tool-call stream → aggregate fragments
+        if (Array.isArray(d.tool_calls)) {
+          for (const tc of d.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCalls[idx]) toolCalls[idx] = { index: idx, id: null, name: '', args: '' };
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.function?.name) toolCalls[idx].name += tc.function.name;
+            if (tc.function?.arguments) toolCalls[idx].args += tc.function.arguments;
+          }
+        }
+      }
+    }
+  } finally {
+    closeReasoningBox();
+    try { reader.releaseLock(); } catch {}
+  }
+
+  if (!content.trim() && !reasoning.trim() && toolCalls.length === 0) {
+    const e = new Error(`Empty stream from ${provider} (no content, no reasoning, no tool calls)`);
+    e.retryable = true;
+    throw e;
+  }
+
+  const finalToolCalls = toolCalls.filter(Boolean).map(tc => ({
+    id: tc.id,
+    type: 'function',
+    function: { name: tc.name, arguments: tc.args || '{}' }
+  })).filter(tc => tc.function.name);
+
+  if (!content.trim() && finalToolCalls.length > 0) {
+    console.log(`\n\x1b[90m(${finalToolCalls.length} tool call(s) requested)\x1b[0m`);
+  } else if (content.trim()) {
+    console.log('');
+  }
+
+  return {
+    content,
+    reasoning,
+    tool_calls: finalToolCalls,
+    finish_reason: finishReason,
+    usage
+  };
+}
 
 /**
  * Call the LLM API with the given messages and tools.
@@ -190,7 +369,7 @@ export async function callLLMApi(messages, toolsList, provider, model, apiKey, c
       // Full OpenAI tool format — the {type:'function'} wrapper is REQUIRED
       tools: toolsList.length > 0 ? toolsList : undefined,
       temperature: 0.7,
-      max_tokens: 4096
+      max_tokens: 16384
     }),
     signal: AbortSignal.timeout(180000)
   }).catch(err => {

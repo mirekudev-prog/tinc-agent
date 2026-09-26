@@ -17,9 +17,10 @@
 import { tools } from './tools.js';
 import { loadBoot, readMemory } from './memory.js';
 import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
-import { loadSession, saveSession, loadTask, clearTask } from './session.js';
-import { callLLMWithRetry, callLLMApi, getRateStatus } from './api.js';
+import { loadSession, saveSession, createSession, listSessions, renameSession, deleteSession, loadTask, clearTask } from './session.js';
+import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from './api.js';
 import { createCompleter } from './completer.js';
+import { observeTurn } from './memory-worker.js';
 
 const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
@@ -256,6 +257,10 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     });
   };
 
+  // Safe wrappers — readline can close (EOF) mid-cycle; never throw on resume
+  const pauseInput = () => { try { rl.pause(); } catch {} };
+  const resumeInput = () => { try { rl.resume(); } catch {} };
+
   // Non-blocking drain of everything typed since the last checkpoint.
   // - /stop|/abort|/interrupt → abort the cycle immediately
   // - other /-commands → abort the cycle and RE-QUEUE them (main prompt handles them)
@@ -366,13 +371,15 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     } catch {}
   }
 
-  const pendingTask = await loadTask();
-  let messages = [];
-  const sessionState = await loadSession();
-  if (sessionState?.messages?.length > 0) {
-    messages = sessionState.messages;
-    console.log(`📂 Resumed session: ${messages.length} messages loaded (/clear to start fresh)`);
+  // ==================== SESSION STATE ====================
+  let session = await loadSession();          // active session (with id)
+  let messages = session.messages || [];
+
+  if (messages.length > 0) {
+    console.log(`📂 Session: ${session.name || 'untitled'} (${messages.length} messages)`);
   }
+
+  const pendingTask = await loadTask();
 
   if (messages.length === 0) {
     const boot = bootContent || await loadBoot();
@@ -592,20 +599,98 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           break;
         }
 
-        case '/resume': {
-          const s = await loadSession();
-          if (s?.messages?.length) {
-            messages = s.messages;
-            console.log(`Loaded ${messages.length} messages into context.`);
+        case '/resume':
+        case '/session': {
+          // List all sessions with an arrow-key picker
+          const sessions = await listSessions();
+          if (!sessions.length) {
+            console.log('No saved sessions yet.');
+            break;
+          }
+          console.log('\nSessions (↑/↓ + Enter, or number, Esc/cancel):');
+          sessions.forEach((s, i) => {
+            const date = s.updated ? new Date(s.updated).toLocaleString() : '?';
+            const marker = s.active ? '←current' : '';
+            console.log(`  ${i + 1}. ${s.name || 'untitled'} — ${s.messageCount} msgs, ${date} ${marker}`);
+          });
+          const pick = (await ask('\nOpen session: ')).trim();
+          if (!pick || pick.toLowerCase() === 'cancel') { console.log('(cancelled)'); break; }
+          const pi = parseInt(pick) - 1;
+          let chosen = sessions[pi];
+          if (!chosen && sessions.find(s => (s.name || 'untitled') === pick)) {
+            chosen = sessions.find(s => (s.name || 'untitled') === pick);
+          }
+          if (!chosen) { console.log('Invalid choice.'); break; }
+          const loaded = await loadSession(chosen.id);
+          if (!loaded?.id) { console.log('Could not load session.'); break; }
+          session = loaded;
+          messages = session.messages || [];
+          console.log(`📂 Switched to: ${session.name || 'untitled'} (${messages.length} messages)`);
+          if (!messages.find(m => m.role === 'system')) {
+            const boot = await loadBoot();
+            const memory = await readMemory();
+            let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
+            if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
+            messages.unshift({ role: 'system', content: sys });
+          }
+          break;
+        }
+
+        case '/new': {
+          const name = args.join(' ') || null;
+          session = await createSession(name, []);
+          messages = session.messages || [];
+          console.log(`🆕 New session: ${name || 'untitled'} (${session.id})`);
+          const boot = await loadBoot();
+          const memory = await readMemory();
+          let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
+          if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
+          messages = [{ role: 'system', content: sys }];
+          break;
+        }
+
+        case '/rename': {
+          const name = args.join(' ').trim();
+          if (!name) {
+            console.log(`Current name: ${session?.name || 'untitled'}. Usage: /rename <word>`);
+            break;
+          }
+          if (session?.id) {
+            session = await renameSession(session.id, name) || session;
+            console.log(`✅ Session renamed to: ${name}`);
           } else {
-            console.log('No saved session.');
+            session = await createSession(name, messages);
+            console.log(`✅ Session created and named: ${name}`);
+          }
+          break;
+        }
+
+        case '/sessions': {
+          const sessions = await listSessions();
+          if (!sessions.length) { console.log('No saved sessions.'); break; }
+          console.log('\nAll sessions:');
+          sessions.forEach((s, i) => {
+            const date = s.updated ? new Date(s.updated).toLocaleString() : '?';
+            console.log(`  ${i + 1}. ${s.name || 'untitled'} — ${s.messageCount} msgs, ${date}${s.active ? ' ←current' : ''}`);
+          });
+          if (args[0] === 'delete' && args[1]) {
+            const di = parseInt(args[1]) - 1;
+            if (sessions[di]) {
+              await deleteSession(sessions[di].id);
+              console.log(`🗑 Deleted: ${sessions[di].name || sessions[di].id}`);
+            } else {
+              console.log('Usage: /sessions delete <number>');
+            }
+          } else {
+            console.log('Switch: /session · delete: /sessions delete <number>');
           }
           break;
         }
 
         case '/clear':
           messages = [];
-          await saveSession({ messages: [], turn: 0 });
+          session.messages = [];
+          session = await saveSession(session);
           console.log('Context cleared.');
           break;
 
@@ -624,22 +709,24 @@ export async function runLoop(providerArg, modelArg, bootContent) {
 
         case '/reload': {
           console.log('💾 Saving session and restarting TINC (fresh code, same conversation)...');
-          await saveSession({ messages: messages.slice(-20), turn: Date.now() });
+          session.messages = messages.slice(-20);
+          session.turn = Date.now();
+          await saveSession(session);
           const { spawn } = await import('child_process');
           const child = spawn(process.execPath, [process.argv[1], 'run'], {
             stdio: 'inherit',
             detached: false,
             env: { ...process.env }
           });
-          // Parent exits; child continues the session from session_state.json
-          process.on('exit', () => { /* child keeps running */ });
           process.exit(0);
           break;
         }
 
         case '/exit':
         case '/quit':
-          await saveSession({ messages: messages.slice(-20), turn: Date.now() });
+          session.messages = messages.slice(-20);
+          session.turn = Date.now();
+          await saveSession(session);
           console.log('👋 Session saved. Goodbye!');
           rl.close();
           process.exit(0);
@@ -669,9 +756,15 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         rounds++;
         if (abortRequested) { abortedByUser = true; break cycle; }
 
+        // ---- GLITCH-FREE STREAMING ----
+        // Pause readline while the model streams: keystrokes buffer in the
+        // terminal line buffer instead of interleaving with/replaying the
+        // streamed output. No screen repaints, no cursor jumps — the stream
+        // owns the screen; typed input lands at the next steering checkpoint.
+        pauseInput();
         const response = await callLLMWithRetry(() => {
           if (abortRequested) throw new Error('Aborted by user');
-          return callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {});
+          return callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {});
         }).then(res => {
           // Record REAL provider-reported usage for accurate ctx display
           if (res.usage?.promptTokens != null) {
@@ -680,6 +773,7 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           }
           return res;
         });
+        resumeInput();
 
         if (abortRequested) { abortedByUser = true; break cycle; }
 
@@ -749,14 +843,36 @@ export async function runLoop(providerArg, modelArg, bootContent) {
 
         // Final answer (no tool calls)
         if (response.content) {
-          console.log('\n' + response.content);
           messages.push({ role: 'assistant', content: response.content });
+          // Auto-continue if the answer was cut off by the token limit —
+          // the model may write code of ANY length across continuations.
+          if (response.finish_reason === 'length') {
+            console.log('\n\x1b[90m(continuing — output limit reached)\x1b[0m');
+            let cont = response;
+            let guard = 0;
+            while (cont.finish_reason === 'length' && guard < 20) {
+              guard++;
+              pauseInput();
+              cont = await callLLMWithRetry(() =>
+                callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {})
+              );
+              resumeInput();
+              if (cont.content) {
+                messages.push({ role: 'assistant', content: cont.content });
+              }
+            }
+          }
         } else {
           console.log('(model returned no content and no tool calls — try rephrasing)');
         }
+
+        // ---- MEMORY WORKER: background pattern extraction ----
+        const lastUserMsg = [...messages].reverse().find(m => m.role === 'user' && !String(m.content).startsWith('[MID-TASK'));
+        observeTurn(messages, lastUserMsg?.content || trimmed, response.content || '').catch(() => {});
         break;
       }
     } catch (error) {
+      resumeInput();
       if (error.message === 'Aborted by user' || abortRequested) {
         abortedByUser = true;
       } else {
@@ -846,6 +962,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     }
 
     // Save session after each turn
-    await saveSession({ messages: messages.slice(-20), turn: Date.now() });
+    session.messages = messages.slice(-20);
+    session.turn = Date.now();
+    session = await saveSession(session);
   }
 }
