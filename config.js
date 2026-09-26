@@ -108,7 +108,7 @@ async function loadConfigRaw() {
   }
 }
 
-async function saveConfig(config) {
+export async function saveConfig(config) {
   await fs.mkdir(DATA_DIR, { recursive: true });
   // Never write plaintext keys to disk
   const toSave = { ...config };

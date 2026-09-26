@@ -16,7 +16,7 @@
 
 import { tools } from './tools.js';
 import { loadBoot, readMemory } from './memory.js';
-import { getConfig, fetchModels, sanitizePrompt } from './config.js';
+import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
 import { loadSession, saveSession, loadTask, clearTask } from './session.js';
 import { callLLMWithRetry, callLLMApi } from './api.js';
 
@@ -78,7 +78,7 @@ function compactContext(messages) {
 
 const SLASH_COMMANDS = {
   '/help': 'Show available commands',
-  '/model [name|list]': 'Show/change model; list fetches live models',
+  '/model [name|list|refresh]': 'Show/change model; list fetches live models; refresh revalidates against provider',
   '/provider [name]': 'Show/switch provider',
   '/resume': 'Reload last session state into context',
   '/clear': 'Clear conversation context (keep config)',
@@ -186,6 +186,58 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     || process.env[`${provider.replace('custom:', '').toUpperCase()}_API_KEY`]
     || '';
 
+  // ============================================================
+  // 2.5 MODEL REFRESH — providers deprecate models; revalidate live
+  // ============================================================
+  // Fetches the live model list from the provider using the API key.
+  // If the configured model is gone, shows the list and prompts a re-pick.
+  // Returns the model to use. Never hardcodes model names.
+  async function refreshModel(silent = false) {
+    if (!apiKey) return model;
+    const models = await fetchModels(provider, apiKey, config.customProviders || {});
+    if (models.length === 0) {
+      if (!silent) console.log('  (could not fetch model list — keeping current model)');
+      return model;
+    }
+    if (model && models.includes(model)) {
+      if (!silent) console.log(`✅ Model "${model}" is still served by ${provider}`);
+      return model;
+    }
+    if (model) {
+      console.log(`\n⚠️  Model "${model}" is no longer served by ${provider}. Available models:`);
+    } else {
+      console.log(`\nAvailable models on ${provider}:`);
+    }
+    models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+    const choice = (await ask('\nSelect model (number, or name): ')).trim();
+    const idx = parseInt(choice) - 1;
+    let picked = models[idx];
+    if (!picked) {
+      if (models.includes(choice)) {
+        picked = choice;
+      } else if (models.length > 0) {
+        picked = models[0];
+        console.log(`(no valid selection — defaulting to first: ${picked})`);
+      }
+    }
+    if (picked) {
+      model = picked;
+      config.model = model;
+      await saveConfig(config);
+      console.log(`✅ Model set to: ${model} (saved to config)`);
+    }
+    return model;
+  }
+
+  // On startup: if a model is configured, silently validate it against the live list.
+  if (model && apiKey && !modelArg) {
+    const models = await fetchModels(provider, apiKey, config.customProviders || {});
+    if (models.length > 0 && !models.includes(model)) {
+      console.log(`\n⚠️  Configured model "${model}" is not in ${provider}'s current list — it may be deprecated.`);
+      await refreshModel(false);
+    }
+  }
+
   const pendingTask = await loadTask();
 
   let messages = [];
@@ -253,12 +305,14 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             const models = await fetchModels(provider, key, config.customProviders || {});
             if (models.length) models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
             else console.log('  (could not fetch models)');
+          } else if (args[0] === 'refresh') {
+            await refreshModel(false);
           } else if (args[0]) {
             model = args.join(' ');
             console.log(`Model set to: ${model} (this session)`);
           } else {
             console.log(`Current model: ${model || '(not set)'} on ${provider}`);
-            console.log('Usage: /model <name> or /model list');
+            console.log('Usage: /model <name> | /model list | /model refresh');
           }
           break;
         }
@@ -429,8 +483,38 @@ export async function runLoop(providerArg, modelArg, bootContent) {
       if (error.message === 'Aborted by user' || abortRequested) {
         abortedByUser = true;
       } else {
-        console.error(`\n❌ LLM error: ${error.message}`);
-        messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+        // AUTO-RECOVERY: provider rejected the model (deprecation, retirement,
+        // 404 model not found, 400 invalid model). Refetch the live list and
+        // prompt a re-pick instead of failing the turn.
+        const deprecationHit = error.status === 404
+          || error.status === 400
+          || /deprecat|not found|no longer|unsupported|invalid model|does not exist/i.test(error.message || '');
+        if (deprecationHit && apiKey) {
+          console.log(`\n⚠️  ${provider} rejected model "${model}" — likely deprecated. Refreshing model list...`);
+          const refreshed = await refreshModel(false);
+          if (refreshed && refreshed !== model) {
+            console.log(`Retrying this turn with ${refreshed}...`);
+            // Re-run the cycle with the new model by simulating a fresh turn
+            // (remove the error message we would have pushed, retry once)
+            try {
+              const response = await callLLMWithRetry(() =>
+                callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {})
+              );
+              if (response.content) {
+                console.log('\n' + response.content);
+                messages.push({ role: 'assistant', content: response.content });
+              }
+            } catch (retryError) {
+              console.error(`\n❌ Retry also failed: ${retryError.message}`);
+              messages.push({ role: 'assistant', content: `Error: ${retryError.message}` });
+            }
+          } else {
+            messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+          }
+        } else {
+          console.error(`\n❌ LLM error: ${error.message}`);
+          messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+        }
       }
     }
 
