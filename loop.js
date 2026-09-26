@@ -261,7 +261,7 @@ function contextUsage(messages) {
   const tokens = lastPromptTokens != null ? lastPromptTokens + (lastTotalTokens != null ? (lastTotalTokens - lastPromptTokens) : 0) : estTokens;
   const limit = getContextLimit();
   const pct = Math.min(100, Math.round((tokens / limit) * 100));
-  return { tokens, pct, msgs: messages.length, real: lastPromptTokens != null };
+  return { tokens, pct, msgs: messages.filter(m => m.role !== 'system').length, real: lastPromptTokens != null };
 }
 
 function ctxColor(pct) {
@@ -545,12 +545,12 @@ export async function runLoop(providerArg, modelArg, bootContent) {
   }
 
   // ==================== SESSION STATE ====================
-  let session = await loadSession();          // active session (with id)
+  // Start with a fresh session every time `tinc run` is called.
+  // Use /session to resume a previous conversation.
+  let session = await createSession(null, []);
   let messages = session.messages || [];
 
-  if (messages.length > 0) {
-    console.log(`📂 Session: ${session.name || 'untitled'} (${messages.length} messages)`);
-  }
+  console.log(`🆕 New session: ${session.id} (type /session to resume a previous conversation)`);
 
   const pendingTask = await loadTask();
 
