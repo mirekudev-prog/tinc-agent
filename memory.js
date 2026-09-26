@@ -1,5 +1,5 @@
 /**
- * TINC Memory Handler - boot.md loader and persistent memory
+ * TINC Memory Handler - boot.md loader, persistent memory, AGENTS.md
  * memory.md lives in ~/.tinc (outside the repo, gitignored by design).
  */
 
@@ -12,6 +12,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOOT_FILE = path.join(__dirname, 'boot.md');
 const DATA_DIR = path.join(os.homedir(), '.tinc');
 const MEMORY_FILE = path.join(DATA_DIR, 'memory.md');
+
+// Project context: AGENTS.md in the cwd (OpenCode/Pi convention).
+// Loaded once per session start, cached by absolute path.
+const projectContextCache = new Map();
+
+export async function loadProjectContext(cwd = process.cwd()) {
+  const dir = path.resolve(cwd);
+  if (projectContextCache.has(dir)) return projectContextCache.get(dir);
+
+  const candidates = [
+    path.join(dir, 'AGENTS.md'),
+    path.join(dir, 'CLAUDE.md'),
+    path.join(dir, '.tinc', 'AGENTS.md')
+  ];
+
+  let content = null;
+  let source = null;
+  for (const c of candidates) {
+    try {
+      const raw = await fs.readFile(c, 'utf-8');
+      if (raw.trim()) { content = raw; source = path.basename(path.dirname(c)) === '.tinc' ? '.tinc/AGENTS.md' : path.basename(c); break; }
+    } catch {}
+  }
+
+  const result = content ? { content, source } : null;
+  projectContextCache.set(dir, result);
+  return result;
+}
 
 export async function loadBoot() {
   try {

@@ -18,7 +18,8 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { tools } from './tools.js';
-import { loadBoot, readMemory } from './memory.js';
+import { loadBoot, readMemory, loadProjectContext } from './memory.js';
+import { snapshotBeforeTurn, undoTurn, redoTurn, listSnapshots, trackFileChange } from './safety.js';
 import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
 import { loadSession, saveSession, createSession, listSessions, renameSession, deleteSession, loadTask, clearTask } from './session.js';
 import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from './api.js';
@@ -83,29 +84,62 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / CHARS_PER_TOKEN);
 }
 
-function compactContext(messages) {
+// ---- LLM-SUMMARIZATION COMPACTION ----
+// At the threshold, older messages are summarized BY THE MODEL into a
+// compact, information-preserving summary instead of naive truncation.
+// Falls back to the old trim-style summary if the API call fails.
+
+async function compactContextWithSummary(messages, provider, model, apiKey, customProviders) {
   const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
-  const estimatedTokens = estimateTokens(String(totalChars));
+  const estimatedTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
   const pct = Math.round((estimatedTokens / getContextLimit()) * 100);
 
   if (pct < COMPACTION_THRESHOLD * 100) {
     return { messages, compacted: false, pct };
   }
 
-  console.log(`\n📝 Context at ${pct}% — compacting old messages...`);
   const systemMsg = messages.find(m => m.role === 'system');
   const recent = messages.slice(-12);
   const older = messages.filter(m => m.role !== 'system').slice(0, -12);
 
-  let summary = '## Previous conversation summary:\n\n';
-  for (const msg of older.slice(-20)) {
-    const role = msg.role === 'assistant' ? 'Assistant' : msg.role === 'tool' ? 'Tool result' : 'User';
-    const preview = (msg.content || '').slice(0, 300);
-    summary += `**${role}**: ${preview}${(msg.content || '').length >= 300 ? '...' : ''}\n\n`;
+  if (older.length === 0) {
+    return { messages, compacted: false, pct };
+  }
+
+  console.log(`\n📝 Context at ${pct}% — summarizing ${older.length} older messages with ${provider}/${model}...`);
+
+  const olderText = older.map(m => {
+    const role = m.role === 'assistant' ? 'Assistant' : m.role === 'tool' ? 'Tool result' : 'User';
+    const body = (m.content || '').slice(0, 600);
+    return `[${role}] ${body}`;
+  }).join('\n\n');
+
+  let summary = null;
+  try {
+    const res = await callLLMApi(
+      [
+        { role: 'system', content: 'You are a conversation summarizer for a coding agent. Produce a dense, information-preserving summary of the conversation so far. Keep: task objectives, decisions made, files touched (with paths), commands run and their outcomes, errors hit and their fixes, user corrections and preferences, anything still pending. Max 400 words. Plain text only.' },
+        { role: 'user', content: olderText }
+      ],
+      [],
+      provider,
+      model,
+      apiKey,
+      customProviders
+    );
+    summary = (res.content || '').trim();
+  } catch {
+    // FALLBACK: naive trim-style summary (old behavior)
+    summary = '## Previous conversation summary:\n\n';
+    for (const msg of older.slice(-20)) {
+      const role = msg.role === 'assistant' ? 'Assistant' : msg.role === 'tool' ? 'Tool result' : 'User';
+      const preview = (msg.content || '').slice(0, 300);
+      summary += `**${role}**: ${preview}${(msg.content || '').length >= 300 ? '...' : ''}\n\n`;
+    }
   }
 
   return {
-    messages: [systemMsg, { role: 'system', content: summary }, ...recent].filter(Boolean),
+    messages: [systemMsg, { role: 'system', content: `## Conversation so far (summarized)\n\n${summary}` }, ...recent].filter(Boolean),
     compacted: true,
     pct
   };
@@ -253,7 +287,9 @@ const SLASH_COMMANDS = {
   '/model [name|list|refresh]': 'Change model; list = interactive picker from live list; refresh = revalidate',
   '/provider [name]': 'Show/switch provider',
   '/context': 'Show context usage (tokens, %, message count)',
-  '/compact': 'Manually compact the conversation now',
+  '/compact': 'Manually compact the conversation now (LLM summarization)',
+  '/undo': 'Revert the last turn\'s file changes (snapshot); /undo list to see snapshots',
+  '/redo': 'Re-apply the undone changes',
   '/resume': 'Reload last session state into context',
   '/clear': 'Clear conversation context (keep config)',
   '/task [clear]': 'Show/clear current task',
@@ -461,6 +497,12 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
     if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
     if (pendingTask) sys += `\n\n## Resumed Task\nObjective: ${pendingTask.objective} — continue this task.`;
+    // Project context: AGENTS.md / CLAUDE.md in the working directory
+    const project = await loadProjectContext(process.cwd());
+    if (project) {
+      sys += `\n\n## Project Instructions (${project.source})\n${project.content}`;
+      console.log(`📁 Loaded project context: ${project.source}`);
+    }
     messages = [{ role: 'system', content: sys }];
   }
 
@@ -788,10 +830,27 @@ export async function runLoop(providerArg, modelArg, bootContent) {
 
         case '/compact': {
           const before = contextUsage(messages);
-          const comp = compactContext(messages);
+          const comp = await compactContextWithSummary(messages, provider, model, apiKey, config.customProviders || {});
           if (comp.compacted) messages = comp.messages;
           const after = contextUsage(messages);
           console.log(`Compacted: ${before.pct}% → ${after.pct}% (${before.msgs} → ${after.msgs} messages)`);
+          break;
+        }
+
+        case '/undo': {
+          if (args[0] === 'list' || args[0] === 'info') {
+            const snaps = await listSnapshots(process.cwd(), 5);
+            if (!snaps.length) { console.log('No snapshots yet.'); break; }
+            console.log('\nRecent snapshots:');
+            snaps.forEach((s, i) => console.log(`  ${i + 1}. ${s.at.toLocaleString()} — "${s.msg}"`));
+            break;
+          }
+          console.log(await undoTurn(process.cwd()));
+          break;
+        }
+
+        case '/redo': {
+          console.log(await redoTurn(process.cwd()));
           break;
         }
 
@@ -944,9 +1003,13 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     if (redacted > 0) {
       console.log(`🔒 ${redacted} sensitive value(s) redacted before sending`);
     }
+    // Snapshot the working tree BEFORE this turn can modify files (for /undo)
+    await snapshotBeforeTurn(process.cwd(), trimmed);
+
     messages.push({ role: 'user', content: sanitized });
 
-    const comp = compactContext(messages);
+    // Compaction with LLM summarization (falls back to trim on API failure)
+    const comp = await compactContextWithSummary(messages, provider, model, apiKey, config.customProviders || {});
     if (comp.compacted) messages = comp.messages;
 
     let rounds = 0;
@@ -1022,6 +1085,14 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             }
 
             console.log(result?.success ? '✅' : '❌', resultJson.slice(0, 200));
+
+            // JOURNAL the change for /undo (write/edit only)
+            if (result?.success && ['write', 'edit'].includes(call.function.name)) {
+              try {
+                const tracked = JSON.parse(call.function.arguments || '{}').path;
+                if (tracked) await trackFileChange(process.cwd(), tracked);
+              } catch {}
+            }
 
             messages.push({
               role: 'tool',
