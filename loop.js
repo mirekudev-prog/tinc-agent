@@ -344,20 +344,45 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     }
   });
 
-  // When the user types "/" at an empty prompt, immediately open the
-  // command selector (like Hermes). This does NOT use live ANSI redraw
-  // — it suspends readline and takes raw stdin, so no terminal corruption.
-  let slashTriggered = false;
+  // Slash command menu - inline list, no readline suspension.
+  let menuActive = false;
+  let menuItems = [];
+  let menuIndex = 0;
+  function showSlashMenu() {
+    const keys = Object.keys(SLASH_COMMANDS);
+    menuItems = keys; menuIndex = 0; menuActive = true;
+    renderMenuList();
+  }
+  function renderMenuList() {
+    if (!menuActive) return;
+    const shown = menuItems;
+    process.stdout.write('\x1b[1B');
+    for (let i = 0; i < shown.length+2; i++) process.stdout.write('\x1b[2K\n');
+    for (let i = 0; i < shown.length+2; i++) process.stdout.write('\x1b[1A');
+    process.stdout.write('  \x1b[90m'+shown.length+' commands\x1b[0m\n');
+    shown.forEach((k, i) => {
+      const prefix = i === menuIndex ? '\x1b[94m> \x1b[0m' : '  ';
+      process.stdout.write(prefix+'\x1b[94m'+k+'\x1b[0m \x1b[90m- '+SLASH_COMMANDS[k]+'\x1b[0m\n');
+    });
+    process.stdout.write('\x1b[1A');
+  }
+  function hideMenu() {
+    if (!menuActive) return;
+    const shown = menuItems;
+    for (let i = 0; i < shown.length+2; i++) process.stdout.write('\x1b[1B\x1b[2K\n');
+    for (let i = 0; i < shown.length+2; i++) process.stdout.write('\x1b[1A');
+    menuActive = false; menuItems = []; menuIndex = 0;
+  }
   rl.on('keypress', (str, key) => {
-    if (!idle || slashTriggered) return;
-    if (str === '/' && (!rl.line || rl.line === '')) {
-      slashTriggered = true;
-      rl.write(null, { ctrl: true, name: 'u' });
-      setImmediate(async () => {
-        slashTriggered = false;
-        await commandSelector();
-      });
+    if (!idle) return;
+    if (menuActive) {
+      if (key.name === 'up') { menuIndex = (menuIndex-1+menuItems.length)%menuItems.length; renderMenuList(); return; }
+      if (key.name === 'down') { menuIndex = (menuIndex+1)%menuItems.length; renderMenuList(); return; }
+      if (key.name === 'enter' && menuItems.length > 0) { hideMenu(); rl.write(null, {ctrl:true,name:'u'}); rl.write(menuItems[menuIndex]); return; }
+      if (key.name === 'escape') { hideMenu(); return; }
+      hideMenu(); return;
     }
+    if (str === '/' && (!rl.line || rl.line === '/')) { showSlashMenu(); return; }
   });
 
   rl.on('close', () => {
@@ -415,24 +440,24 @@ export async function runLoop(providerArg, modelArg, bootContent) {
   // cursor: it suspends readline and takes raw stdin, like a menu.
   // ============================================================
 
-  async function commandSelector() {
-    const keys = Object.keys(SLASH_COMMANDS);
-    const items = keys.map(k => ({
-      label: k,
-      hint: SLASH_COMMANDS[k]
-    }));
-    const sel = await selectFromList('TINC Commands', items, { suspendRl: rl });
-    if (sel >= 0) {
-      // Put the chosen command into the prompt buffer, let the user
-      // press Enter to run it (allows adding args first).
-      rl.write(keys[sel].split(' ')[0]);
-    }
-    // sel === -1 (Esc/Ctrl+C) or -2 (non-TTY) → just return to the prompt
-  }
+  // Inline slash menu replaces commandSelector.
 
-  // Safe wrappers — readline can close (EOF) mid-cycle; never throw on resume
-  const pauseInput = () => { try { rl.pause(); } catch {} };
-  const resumeInput = () => { try { rl.resume(); } catch {} };
+  // Live status bar updater - refreshes every 500ms during streaming.
+  let statusTimer = null;
+  function startStatusUpdates() {
+    stopStatusUpdates();
+    statusTimer = setInterval(() => {
+      if (!idle) return;
+      process.stdout.write('\x1b[2K\r');
+      const { tokens, pct, msgs } = contextUsage(messages);
+      const limit = getContextLimit();
+      const shortModel = model ? model.split('/').pop() : 'no model';
+      process.stdout.write('\x1b[90m'+(provider||'unset')+'\x1b[0m/\x1b[94m'+shortModel+'\x1b[0m ');
+      process.stdout.write('| '+pct+'% \x1b[90m('+Math.round(tokens/1000)+'k/'+Math.round(limit/1000)+'k)\x1b[0m ');
+      process.stdout.write('| \x1b[90m'+msgs+' msgs\x1b[0m\n> ');
+    }, 500);
+  }
+  function stopStatusUpdates() { if (statusTimer) { clearInterval(statusTimer); statusTimer = null; } }
 
   // Non-blocking drain of everything typed since the last checkpoint.
   // - /stop|/abort|/interrupt → abort the cycle immediately
@@ -594,9 +619,9 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     const trimmed = input.trim();
     if (!trimmed) continue;
 
-    // "/" alone + Enter opens the full arrow-key command selector
+    // "/" alone opens the inline command menu
     if (trimmed === '/') {
-      await commandSelector();
+      showSlashMenu();
       continue;
     }
 
@@ -1091,17 +1116,12 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         rounds++;
         if (abortRequested) { abortedByUser = true; break cycle; }
 
-        // Show the text box before streaming so the user can type the
-        // next message while the model works.
-        displayPrompt();
-
         // ---- GLITCH-FREE STREAMING ----
-        // KEEP readline active during streaming so the text box (' > ') stays
-        // visible — the user can type the next message while the model works.
-        // Typed lines buffer into lineQueue via the 'line' handler and are
-        // delivered at the steering checkpoint below (no screen glitc hes,
-        // no disappeared prompt). The streaming output writes to stdout and
-        // readline redraws its prompt line after each chunk completes naturally.
+        // readline stays active during streaming so the text box (' > ')
+        // stays visible — the user can type the next instruction while
+        // the model works. Typed lines buffer into lineQueue at checkpoints.
+        // Live status updates every 500ms.
+        startStatusUpdates();
         const response = await callLLMWithRetry(() => {
           if (abortRequested) throw new Error('Aborted by user');
           return callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {});
@@ -1113,6 +1133,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           }
           return res;
         });
+        stopStatusUpdates();
+        displayPrompt();
 
         if (abortRequested) { abortedByUser = true; break cycle; }
 
@@ -1191,9 +1213,11 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             let guard = 0;
             while (cont.finish_reason === 'length' && guard < 20) {
               guard++;
+              startStatusUpdates();
               cont = await callLLMWithRetry(() =>
                 callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {})
               );
+              stopStatusUpdates();
               if (cont.content) {
                 messages.push({ role: 'assistant', content: cont.content });
               }
@@ -1209,6 +1233,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         break;
       }
     } catch (error) {
+      stopStatusUpdates();
+      displayPrompt();
       if (error.message === 'Aborted by user' || abortRequested) {
         abortedByUser = true;
       } else {
