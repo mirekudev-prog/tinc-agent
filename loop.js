@@ -559,7 +559,15 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             model = args.join(' ');
             config.model = model;
             await saveConfig(config);
-            console.log(`Model set to: ${model} (saved)`);
+            modelMetaCache.delete(`${provider}::${model}`);
+            lastPromptTokens = null;
+            lastTotalTokens = null;
+            try {
+              const learned = config.learnedLimits?.[`${provider}::${model}`];
+              CONTEXT_LIMIT = learned || await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+              console.log(`📐 Context limit for ${model}: ${Math.round(CONTEXT_LIMIT / 1000)}k`);
+            } catch {}
+            console.log(`Model set to: ${model} (global — saved for all sessions)`);
           } else {
             console.log(`Current model: ${model || '(not set)'} on ${provider}`);
             console.log('Usage: /model <name> | /model list | /model refresh');
@@ -578,7 +586,47 @@ export async function runLoop(providerArg, modelArg, bootContent) {
                 const k = await ask(`No key stored for ${p}. Enter API key (or blank to skip): `);
                 if (k.trim()) { config.apiKeys[p] = k.trim(); apiKey = k.trim(); }
               }
-              console.log(`Provider set to: ${provider}`);
+              // GLOBAL: persist provider so every future session uses it
+              config.provider = provider;
+              await saveConfig(config);
+              // Re-resolve model validity + context limit on the new provider
+              if (apiKey) {
+                const models = await fetchModels(provider, apiKey, config.customProviders || {});
+                if (models.length && !models.includes(model)) {
+                  const items = models.map(m => ({ label: m, hint: '' }));
+                  const sel = await selectFromList(`Pick a model on ${provider} (current "${model}" not available)`, items, {
+                    startIndex: 0, suspendRl: rl
+                  });
+                  let picked = null;
+                  if (sel >= 0) picked = models[sel];
+                  else if (sel === -2) {
+                    const choice = (await ask('Select model (number or name, blank=keep): ')).trim();
+                    if (choice) picked = models[parseInt(choice) - 1] || (models.includes(choice) ? choice : null);
+                  }
+                  if (picked) {
+                    model = picked;
+                    config.model = model;
+                    modelMetaCache.delete(`${provider}::${model}`);
+                    lastPromptTokens = null;
+                    lastTotalTokens = null;
+                    try {
+                      const learned = config.learnedLimits?.[`${provider}::${model}`];
+                      CONTEXT_LIMIT = learned || await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+                      console.log(`📐 Context limit for ${model}: ${Math.round(CONTEXT_LIMIT / 1000)}k`);
+                    } catch {}
+                  }
+                } else if (models.length) {
+                  // Model still valid — just re-resolve the context limit
+                  modelMetaCache.delete(`${provider}::${model}`);
+                  try {
+                    const learned = config.learnedLimits?.[`${provider}::${model}`];
+                    CONTEXT_LIMIT = learned || await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+                  } catch {}
+                }
+                await saveConfig(config);
+              }
+              console.log(`✅ Provider set to: ${provider} (global — saved for all sessions)`);
+              if (model) console.log(`   Model: ${model}`);
             } else {
               console.log('Unknown provider. Available: groq, mistral, cerebras, nvidia, openrouter, custom:<name>');
             }
