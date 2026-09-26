@@ -21,6 +21,7 @@ import { loadSession, saveSession, createSession, listSessions, renameSession, d
 import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from './api.js';
 import { createCompleter } from './completer.js';
 import { observeTurn } from './memory-worker.js';
+import { selectFromList } from './selector.js';
 
 const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
@@ -452,18 +453,28 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             console.log(`Fetching models from ${provider}...`);
             const models = await fetchModels(provider, key, config.customProviders || {});
             if (!models.length) { console.log('  (could not fetch models)'); break; }
-            // INTERACTIVE PICKER — select by number or exact name, or blank to cancel
-            console.log('\nAvailable models:');
-            models.forEach((m, i) => console.log(`  ${i + 1}. ${m}${m === model ? '  ← current' : ''}`));
-            const choice = (await ask('\nSelect model number (or name, blank=cancel): ')).trim();
-            if (!choice) { console.log('(cancelled)'); break; }
-            const idx = parseInt(choice) - 1;
-            let picked = models[idx];
-            if (!picked && models.includes(choice)) picked = choice;
-            if (!picked) { console.log(`"${choice}" is not a valid choice.`); break; }
+            const items = models.map(m => ({ label: m, hint: m === model ? 'current' : '' }));
+            const sel = await selectFromList(`Models on ${provider}`, items, {
+              startIndex: Math.max(0, models.indexOf(model)),
+              suspendRl: rl
+            });
+            let picked = null;
+            if (sel >= 0) picked = models[sel];
+            else if (sel === -2) {
+              const choice = (await ask('Select model (number or name, blank=cancel): ')).trim();
+              if (choice) {
+                const idx = parseInt(choice) - 1;
+                picked = models[idx] || (models.includes(choice) ? choice : null);
+              }
+            }
+            if (!picked) { if (sel !== -1) console.log('(no selection)'); break; }
             model = picked;
             config.model = model;
             await saveConfig(config);
+            // Update live context limit for the new model
+            try {
+              CONTEXT_LIMIT = await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+            } catch {}
             console.log(`✅ Model set to: ${model} (saved)`);
           } else if (args[0] === 'refresh') {
             await refreshModel(false);
@@ -601,26 +612,31 @@ export async function runLoop(providerArg, modelArg, bootContent) {
 
         case '/resume':
         case '/session': {
-          // List all sessions with an arrow-key picker
           const sessions = await listSessions();
           if (!sessions.length) {
             console.log('No saved sessions yet.');
             break;
           }
-          console.log('\nSessions (↑/↓ + Enter, or number, Esc/cancel):');
-          sessions.forEach((s, i) => {
-            const date = s.updated ? new Date(s.updated).toLocaleString() : '?';
-            const marker = s.active ? '←current' : '';
-            console.log(`  ${i + 1}. ${s.name || 'untitled'} — ${s.messageCount} msgs, ${date} ${marker}`);
+          const items = sessions.map(s => ({
+            label: s.name || 'untitled',
+            hint: `${s.messageCount} msgs · ${s.updated ? new Date(s.updated).toLocaleString() : '?'}${s.active ? ' · current' : ''}`
+          }));
+
+          // Arrow-key selector (TTY) — falls back to number/name input when piped
+          let sel = await selectFromList('Sessions', items, {
+            startIndex: Math.max(0, sessions.findIndex(s => s.active)),
+            suspendRl: rl
           });
-          const pick = (await ask('\nOpen session: ')).trim();
-          if (!pick || pick.toLowerCase() === 'cancel') { console.log('(cancelled)'); break; }
-          const pi = parseInt(pick) - 1;
-          let chosen = sessions[pi];
-          if (!chosen && sessions.find(s => (s.name || 'untitled') === pick)) {
-            chosen = sessions.find(s => (s.name || 'untitled') === pick);
+          let chosen;
+          if (sel === -2) {
+            const pick = (await ask('Open session (number or name): ')).trim();
+            if (!pick || pick.toLowerCase() === 'cancel') { console.log('(cancelled)'); break; }
+            const pi = parseInt(pick) - 1;
+            chosen = sessions[pi] || sessions.find(s => (s.name || 'untitled') === pick);
+          } else if (sel >= 0) {
+            chosen = sessions[sel];
           }
-          if (!chosen) { console.log('Invalid choice.'); break; }
+          if (!chosen) { if (sel !== -1) console.log('Invalid choice.'); break; }
           const loaded = await loadSession(chosen.id);
           if (!loaded?.id) { console.log('Could not load session.'); break; }
           session = loaded;
