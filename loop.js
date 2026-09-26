@@ -18,7 +18,8 @@ import { tools } from './tools.js';
 import { loadBoot, readMemory } from './memory.js';
 import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
 import { loadSession, saveSession, loadTask, clearTask } from './session.js';
-import { callLLMWithRetry, callLLMApi } from './api.js';
+import { callLLMWithRetry, callLLMApi, getRateStatus } from './api.js';
+import { createCompleter } from './completer.js';
 
 const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
@@ -40,9 +41,26 @@ RULES:
 - Never output AI guidelines, disclaimers, or "how things are usually done" filler.`;
 
 const CHARS_PER_TOKEN = 4;
-const DEFAULT_CONTEXT_LIMIT = 128000;
+const FALLBACK_CONTEXT_LIMIT = 128000;
 const COMPACTION_THRESHOLD = 0.7;
 const MAX_TOOL_ROUNDS = 25;
+
+// Session-scoped context limit — set from live metadata, learned from
+// overflow errors, or overridden manually. Falls back to 128k.
+let CONTEXT_LIMIT = FALLBACK_CONTEXT_LIMIT;
+function getContextLimit() { return CONTEXT_LIMIT; }
+
+// Real token usage reported by the provider on the last call
+let lastPromptTokens = null;
+let lastTotalTokens = null;
+
+function setContextLimit(newLimit, source) {
+  const prev = CONTEXT_LIMIT;
+  CONTEXT_LIMIT = newLimit;
+  if (newLimit !== prev) {
+    console.log(`📐 Context limit: ${Math.round(newLimit / 1000)}k tokens (${source})`);
+  }
+}
 
 function estimateTokens(text) {
   return Math.ceil((text || '').length / CHARS_PER_TOKEN);
@@ -51,7 +69,7 @@ function estimateTokens(text) {
 function compactContext(messages) {
   const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
   const estimatedTokens = estimateTokens(String(totalChars));
-  const pct = Math.round((estimatedTokens / DEFAULT_CONTEXT_LIMIT) * 100);
+  const pct = Math.round((estimatedTokens / getContextLimit()) * 100);
 
   if (pct < COMPACTION_THRESHOLD * 100) {
     return { messages, compacted: false, pct };
@@ -77,17 +95,55 @@ function compactContext(messages) {
 }
 
 // ============================================================
+// MODEL METADATA — live context window per model (no hardcoding)
+// ============================================================
+// Fetches /v1/models/:id and reads max_context_window / context_length
+// fields (NVIDIA NIM exposes max_context_window). Falls back to 128k
+// when the field is missing, and caches per model for the session.
+
+const modelMetaCache = new Map();
+
+export async function getModelContextLimit(provider, model, apiKey, customProviders = {}) {
+  const cacheKey = `${provider}::${model}`;
+  if (modelMetaCache.has(cacheKey)) return modelMetaCache.get(cacheKey);
+
+  let limit = 128000;
+  try {
+    const baseUrl = resolveBaseUrl(provider, customProviders);
+    if (baseUrl) {
+      const url = `${baseUrl.replace(/\/+$/, '')}/models/${encodeURIComponent(model)}`;
+      const r = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(15000)
+      });
+      if (r.ok) {
+        const d = await r.json();
+        const m = d.data || d;
+        const raw = m.max_context_window ?? m.context_length ?? m.max_model_len ?? m.context_window;
+        if (typeof raw === 'number' && raw > 0) limit = raw;
+        else if (Array.isArray(m.context_length)) limit = Math.max(...m.context_length);
+      }
+    }
+  } catch {}
+  modelMetaCache.set(cacheKey, limit);
+  return limit;
+}
+
+// ============================================================
 // STATUS LINE — OpenCode-style, inline (Termux touch scroll safe)
 // ============================================================
 // Rendered before every prompt: provider/model | ctx % | msg count.
 // Colors: ctx <50% green, <80% yellow, >=80% red.
 
 function contextUsage(messages) {
+  // Prefer REAL provider-reported usage from the last call; fall back to estimate
   const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0) +
     (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0), 0);
-  const tokens = estimateTokens(String(totalChars));
-  const pct = Math.min(100, Math.round((tokens / DEFAULT_CONTEXT_LIMIT) * 100));
-  return { tokens, pct, msgs: messages.length };
+  const estTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
+  const tokens = lastPromptTokens != null ? lastPromptTokens + (lastTotalTokens != null ? (lastTotalTokens - lastPromptTokens) : 0) : estTokens;
+  const limit = getContextLimit();
+  const pct = Math.min(100, Math.round((tokens / limit) * 100));
+  return { tokens, pct, msgs: messages.length, real: lastPromptTokens != null };
 }
 
 function ctxColor(pct) {
@@ -99,10 +155,13 @@ function ctxColor(pct) {
 function statusLine(provider, model, messages) {
   const { tokens, pct, msgs } = contextUsage(messages);
   const c = ctxColor(pct);
+  const limit = getContextLimit();
   const shortModel = model ? model.split('/').pop() : 'no model';
+  const rate = getRateStatus(provider);
   return `\x1b[90m${provider || 'unset'}\x1b[0m/\x1b[94m${shortModel}\x1b[0m ` +
-    `│ ${c}ctx ${pct}%\x1b[0m \x1b[90m(${Math.round(tokens / 1000)}k/${DEFAULT_CONTEXT_LIMIT / 1000}k)\x1b[0m ` +
-    `│ \x1b[90m${msgs} msgs\x1b[0m`;
+    `│ ${c}ctx ${pct}%\x1b[0m \x1b[90m(${Math.round(tokens / 1000)}k/${Math.round(limit / 1000)}k)\x1b[0m ` +
+    `│ \x1b[90m${msgs} msgs\x1b[0m` +
+    (rate.budget ? ` │ \x1b[90mrpm ${rate.used}/${rate.budget}\x1b[0m` : '');
 }
 
 const SLASH_COMMANDS = {
@@ -114,8 +173,9 @@ const SLASH_COMMANDS = {
   '/resume': 'Reload last session state into context',
   '/clear': 'Clear conversation context (keep config)',
   '/task [clear]': 'Show/clear current task',
-  '/reload': 'Reload boot.md + memory.md and restart the loop',
+  '/reload': 'Restart TINC process (fresh code) and resume this session',
   '/stop': 'Abort the running agent cycle (or Ctrl+C)',
+  '/login': 'Change provider/model/API key interactively',
   '/exit': 'Quit TINC'
 };
 
@@ -269,8 +329,21 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     }
   }
 
-  const pendingTask = await loadTask();
+  // Context limit resolution priority:
+  //   1. Manually learned limit persisted in config (from overflow errors)
+  //   2. Live model metadata (providers that expose it, e.g. OpenRouter)
+  //   3. 128k fallback
+  const learnedKey = `${provider}::${model}`;
+  if (config.learnedLimits?.[learnedKey]) {
+    setContextLimit(config.learnedLimits[learnedKey], 'learned from provider');
+  } else {
+    try {
+      const limit = await getModelContextLimit(provider, model, apiKey, config.customProviders || {});
+      setContextLimit(limit || FALLBACK_CONTEXT_LIMIT, 'model metadata');
+    } catch {}
+  }
 
+  const pendingTask = await loadTask();
   let messages = [];
   const sessionState = await loadSession();
   if (sessionState?.messages?.length > 0) {
@@ -385,11 +458,92 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         }
 
         case '/context': {
-          const { tokens, pct, msgs } = contextUsage(messages);
+          const { tokens, pct, msgs, real } = contextUsage(messages);
           const c = ctxColor(pct);
-          console.log(`\n  Context: ${c}${pct}%\x1b[0m (${tokens} tokens est. / ${DEFAULT_CONTEXT_LIMIT} limit)`);
+          console.log(`\n  Context: ${c}${pct}%\x1b[0m (${tokens} tokens ${real ? '(provider-reported)' : '(estimated)'} / ${getContextLimit()} limit)`);
           console.log(`  Messages: ${msgs}`);
+          const rate = getRateStatus(provider);
+          console.log(`  Rate: ${rate.used}/${rate.budget} requests this minute (${provider})`);
           console.log(`  Compaction triggers at ${COMPACTION_THRESHOLD * 100}%`);
+          if (args[0] === 'limit' && args[1]) {
+            const n = parseInt(args[1].replace(/[^0-9]/g, ''));
+            if (n > 0) {
+              setContextLimit(n, 'manual override');
+              config.learnedLimits = { ...(config.learnedLimits || {}), [`${provider}::${model}`]: n };
+              await saveConfig(config);
+              console.log(`  ✅ Limit set to ${n} and saved for ${model}`);
+            } else {
+              console.log('  Usage: /context limit 1000000');
+            }
+          } else {
+            console.log('  Set manually: /context limit <tokens>');
+          }
+          break;
+        }
+
+        case '/login': {
+          // Interactive provider/key switch — the missing entry point
+          const allProviders = ['groq', 'mistral', 'cerebras', 'nvidia', 'openrouter'];
+          console.log('\nProviders:');
+          allProviders.forEach((p, i) => {
+            const hasKey = !!(config.apiKeys[p] || process.env[`${p.toUpperCase()}_API_KEY`]);
+            const custom = p === provider ? '  ← current' : '';
+            console.log(`  ${i + 1}. ${p}${hasKey ? ' (key saved)' : ''}${custom}`);
+          });
+          const customNames = Object.keys(config.customProviders || {});
+          if (customNames.length) {
+            customNames.forEach((n, i) => console.log(`  ${allProviders.length + 1 + i}. custom:${n}`));
+          }
+          console.log('  0. cancel');
+          const choice = (await ask('Select provider: ')).trim();
+          const idx = parseInt(choice) - 1;
+          let picked;
+          if (choice === '0' || !choice) { console.log('(cancelled)'); break; }
+          if (idx >= 0 && idx < allProviders.length) picked = allProviders[idx];
+          else if (customNames[idx - allProviders.length]) picked = 'custom:' + customNames[idx - allProviders.length];
+          else if (allProviders.includes(choice) || (choice.startsWith('custom:') && config.customProviders[choice.slice(7)])) picked = choice;
+          if (!picked) { console.log('Invalid choice.'); break; }
+
+          let key = config.apiKeys[picked] || process.env[`${picked.replace('custom:', '').toUpperCase()}_API_KEY`] || '';
+          if (!key) {
+            const k = await ask(`Enter API key for ${picked} (blank to cancel): `);
+            if (!k.trim()) { console.log('(cancelled)'); break; }
+            key = k.trim();
+          } else {
+            const newKey = await ask(`Key already saved. Enter new key or blank to keep: `);
+            if (newKey.trim()) key = newKey.trim();
+          }
+          config.apiKeys[picked] = key;
+          provider = picked;
+          apiKey = key;
+
+          // Fetch live models for the new provider and pick one
+          const models = await fetchModels(provider, apiKey, config.customProviders || {});
+          if (models.length) {
+            console.log(`\nAvailable models on ${provider}:`);
+            models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+            const mc = (await ask('Select model number (or name, blank = keep current if valid): ')).trim();
+            if (mc) {
+              const mi = parseInt(mc) - 1;
+              const chosen = models[mi] || (models.includes(mc) ? mc : null);
+              if (chosen) model = chosen;
+              else console.log('(invalid — keeping current model)');
+            } else if (!models.includes(model)) {
+              model = models[0];
+              console.log(`(current model not on ${provider} — defaulting to ${model})`);
+            }
+          } else {
+            const manual = await ask('Could not fetch models. Enter model ID (blank = keep): ');
+            if (manual.trim()) model = manual.trim();
+          }
+          config.provider = provider;
+          config.model = model;
+          await saveConfig(config);
+          // Update live context limit for the new model
+          try {
+            CONTEXT_LIMIT = await getModelContextLimit(provider, model, apiKey, config.customProviders || {}) || FALLBACK_CONTEXT_LIMIT;
+          } catch {}
+          console.log(`✅ Logged in: ${provider}/${model}`);
           break;
         }
 
@@ -433,15 +587,17 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         }
 
         case '/reload': {
-          console.log('Reloading boot.md + memory.md...');
-          const boot = await loadBoot();
-          const memory = await readMemory();
-          let sys = SYSTEM_PROMPT + (boot ? '\n\n' + boot : '');
-          if (memory) sys += `\n\n## Persistent Memory\n${memory}`;
-          const pending = await loadTask();
-          if (pending) sys += `\n\n## Resumed Task\nObjective: ${pending.objective} — continue this task.`;
-          messages = [{ role: 'system', content: sys }];
-          console.log('Reloaded.');
+          console.log('💾 Saving session and restarting TINC (fresh code, same conversation)...');
+          await saveSession({ messages: messages.slice(-20), turn: Date.now() });
+          const { spawn } = await import('child_process');
+          const child = spawn(process.execPath, [process.argv[1], 'run'], {
+            stdio: 'inherit',
+            detached: false,
+            env: { ...process.env }
+          });
+          // Parent exits; child continues the session from session_state.json
+          process.on('exit', () => { /* child keeps running */ });
+          process.exit(0);
           break;
         }
 
@@ -480,6 +636,13 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         const response = await callLLMWithRetry(() => {
           if (abortRequested) throw new Error('Aborted by user');
           return callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {});
+        }).then(res => {
+          // Record REAL provider-reported usage for accurate ctx display
+          if (res.usage?.promptTokens != null) {
+            lastPromptTokens = res.usage.promptTokens;
+            lastTotalTokens = res.usage.totalTokens ?? res.usage.promptTokens;
+          }
+          return res;
         });
 
         if (abortRequested) { abortedByUser = true; break cycle; }
@@ -563,9 +726,21 @@ export async function runLoop(providerArg, modelArg, bootContent) {
       } else {
         // CONTEXT OVERFLOW: "reduce the length of the messages" — compact hard and retry.
         // This is NOT a deprecation; the old recovery misfired on it.
+        // Also LEARN the real context limit from the error text when present.
         const isContextOverflow = error.status === 400
           && /reduce the length|context (length|window)|maximum context|too (large|long)/i.test(error.message || '');
         if (isContextOverflow) {
+          // Learn: "maximum context length is 131072 tokens" / "context window of 1000000"
+          const limitMatch = (error.message || '').match(/(?:maximum context (?:length|window)(?: is| of)|context window of)\s*([\d,]+)\s*tokens?/i);
+          if (limitMatch) {
+            const learned = parseInt(limitMatch[1].replace(/,/g, ''));
+            if (learned > 0 && learned !== getContextLimit()) {
+              setContextLimit(learned, 'learned from provider error');
+              // Persist so future sessions start with the right limit
+              config.learnedLimits = { ...(config.learnedLimits || {}), [`${provider}::${model}`]: learned };
+              await saveConfig(config);
+            }
+          }
           console.log('\n⚠️  Context overflow — compacting conversation and retrying...');
           // Aggressive compaction: keep system + last 6 messages only
           const systemMsg = messages.find(m => m.role === 'system');
