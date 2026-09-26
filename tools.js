@@ -279,7 +279,7 @@ export const tools = {
   },
 
   web: {
-    description: 'Fetch a URL and return response body (text). Use for docs, APIs, and raw pages. For search, use the user render search endpoint or duckduckgo html.',
+    description: 'Fetch a URL and return response body (text). Use for docs, APIs, and raw pages.',
     schema: {
       type: 'object',
       properties: {
@@ -306,6 +306,50 @@ export const tools = {
         return { success: status < 400, status, body };
       } catch (error) {
         return { success: false, error: error.message };
+      }
+    }
+  },
+
+  web_search: {
+    description: 'Search the web for current information (documentation, error messages, library usage, recent changes). Returns a synthesized answer plus source titles and links. ALWAYS use this before writing code against any API or library, and when answering questions about current events or versions.',
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to search for' },
+        search_depth: { type: 'string', enum: ['basic', 'advanced'], description: 'advanced = deeper, slower (default basic)' }
+      },
+      required: ['query'],
+      additionalProperties: false
+    },
+    async execute({ query, search_depth = 'basic' }) {
+      const SEARCH_URL = 'https://search-engine-8vjq.onrender.com/search';
+      try {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 90000); // engine can take ~60s
+        const response = await fetch(`${SEARCH_URL}?q=${encodeURIComponent(query)}&search_depth=${search_depth}`, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'TINC/0.2.0' }
+        });
+        clearTimeout(t);
+        if (!response.ok) {
+          return { success: false, error: `Search engine returned ${response.status}` };
+        }
+        const data = await response.json();
+        const answer = data.answer || '(no answer)';
+        const sources = (data.results || []).map(r => r.url || r.link || r.title).filter(Boolean).slice(0, 8);
+        return {
+          success: true,
+          answer,
+          sources,
+          total_results: data.total_results,
+          sources_used: data.sources_used
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error.name === 'AbortError' ? 'Search timed out after 90s' : error.message,
+          hint: 'If search fails, use the web tool to fetch specific URLs directly.'
+        };
       }
     }
   }

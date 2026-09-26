@@ -30,11 +30,11 @@ WORK ETHIC:
 - When the user sends a [MID-TASK INSTRUCTION], it arrived while you were working. Fold it into your current task immediately — it overrides earlier priorities.
 
 TOOLS:
-read, write, edit, bash, memory, github, task, web
+read, write, edit, bash, memory, github, task, web, web_search
 
 RULES:
 - Be brutally concise. Zero fluff. Zero hallucinations.
-- Use bash for installs, builds, git, running code. Use web to verify current documentation before writing code against APIs.
+- Use bash for installs, builds, git, running code. Use web_search to verify current documentation before writing code against any API or library — never code from stale memory.
 - Save long-lived lessons to memory. Save task objectives with the task tool before long multi-step work.
 - When editing your own files (tools.js, loop.js, boot.md, etc.), keep changes minimal and targeted.
 - Never output AI guidelines, disclaimers, or "how things are usually done" filler.`;
@@ -76,10 +76,41 @@ function compactContext(messages) {
   };
 }
 
+// ============================================================
+// STATUS LINE — OpenCode-style, inline (Termux touch scroll safe)
+// ============================================================
+// Rendered before every prompt: provider/model | ctx % | msg count.
+// Colors: ctx <50% green, <80% yellow, >=80% red.
+
+function contextUsage(messages) {
+  const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0) +
+    (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0), 0);
+  const tokens = estimateTokens(String(totalChars));
+  const pct = Math.min(100, Math.round((tokens / DEFAULT_CONTEXT_LIMIT) * 100));
+  return { tokens, pct, msgs: messages.length };
+}
+
+function ctxColor(pct) {
+  if (pct >= 80) return '\x1b[91m';
+  if (pct >= 50) return '\x1b[93m';
+  return '\x1b[92m';
+}
+
+function statusLine(provider, model, messages) {
+  const { tokens, pct, msgs } = contextUsage(messages);
+  const c = ctxColor(pct);
+  const shortModel = model ? model.split('/').pop() : 'no model';
+  return `\x1b[90m${provider || 'unset'}\x1b[0m/\x1b[94m${shortModel}\x1b[0m ` +
+    `│ ${c}ctx ${pct}%\x1b[0m \x1b[90m(${Math.round(tokens / 1000)}k/${DEFAULT_CONTEXT_LIMIT / 1000}k)\x1b[0m ` +
+    `│ \x1b[90m${msgs} msgs\x1b[0m`;
+}
+
 const SLASH_COMMANDS = {
   '/help': 'Show available commands',
-  '/model [name|list|refresh]': 'Show/change model; list fetches live models; refresh revalidates against provider',
+  '/model [name|list|refresh]': 'Change model; list = interactive picker from live list; refresh = revalidate',
   '/provider [name]': 'Show/switch provider',
+  '/context': 'Show context usage (tokens, %, message count)',
+  '/compact': 'Manually compact the conversation now',
   '/resume': 'Reload last session state into context',
   '/clear': 'Clear conversation context (keep config)',
   '/task [clear]': 'Show/clear current task',
@@ -274,7 +305,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
   // ============================================================
   while (true) {
     idle = true;
-    const input = await ask('\n> ');
+    // STATUS LINE before every prompt — OpenCode-style visibility
+    const input = await ask(`\n${statusLine(provider, model, messages)}\n> `);
     idle = false;
     const trimmed = input.trim();
     if (!trimmed) continue;
@@ -303,13 +335,27 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             if (!key) { console.log('  (no API key configured)'); break; }
             console.log(`Fetching models from ${provider}...`);
             const models = await fetchModels(provider, key, config.customProviders || {});
-            if (models.length) models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
-            else console.log('  (could not fetch models)');
+            if (!models.length) { console.log('  (could not fetch models)'); break; }
+            // INTERACTIVE PICKER — select by number or exact name, or blank to cancel
+            console.log('\nAvailable models:');
+            models.forEach((m, i) => console.log(`  ${i + 1}. ${m}${m === model ? '  ← current' : ''}`));
+            const choice = (await ask('\nSelect model number (or name, blank=cancel): ')).trim();
+            if (!choice) { console.log('(cancelled)'); break; }
+            const idx = parseInt(choice) - 1;
+            let picked = models[idx];
+            if (!picked && models.includes(choice)) picked = choice;
+            if (!picked) { console.log(`"${choice}" is not a valid choice.`); break; }
+            model = picked;
+            config.model = model;
+            await saveConfig(config);
+            console.log(`✅ Model set to: ${model} (saved)`);
           } else if (args[0] === 'refresh') {
             await refreshModel(false);
           } else if (args[0]) {
             model = args.join(' ');
-            console.log(`Model set to: ${model} (this session)`);
+            config.model = model;
+            await saveConfig(config);
+            console.log(`Model set to: ${model} (saved)`);
           } else {
             console.log(`Current model: ${model || '(not set)'} on ${provider}`);
             console.log('Usage: /model <name> | /model list | /model refresh');
@@ -335,6 +381,24 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           } else {
             console.log(`Current provider: ${provider}`);
           }
+          break;
+        }
+
+        case '/context': {
+          const { tokens, pct, msgs } = contextUsage(messages);
+          const c = ctxColor(pct);
+          console.log(`\n  Context: ${c}${pct}%\x1b[0m (${tokens} tokens est. / ${DEFAULT_CONTEXT_LIMIT} limit)`);
+          console.log(`  Messages: ${msgs}`);
+          console.log(`  Compaction triggers at ${COMPACTION_THRESHOLD * 100}%`);
+          break;
+        }
+
+        case '/compact': {
+          const before = contextUsage(messages);
+          const comp = compactContext(messages);
+          if (comp.compacted) messages = comp.messages;
+          const after = contextUsage(messages);
+          console.log(`Compacted: ${before.pct}% → ${after.pct}% (${before.msgs} → ${after.msgs} messages)`);
           break;
         }
 
@@ -449,11 +513,25 @@ export async function runLoop(providerArg, modelArg, bootContent) {
                 result = { success: false, error: error.message };
               }
             }
-            console.log(result?.success ? '✅' : '❌', JSON.stringify(result).slice(0, 200));
+
+            // HARD CAP on tool output before it enters the context —
+            // a single huge grep/ls must never blow the whole window.
+            const TOOL_RESULT_LIMIT = 6000; // chars
+            let resultJson = JSON.stringify(result);
+            if (resultJson.length > TOOL_RESULT_LIMIT) {
+              const note = `...[output truncated — ${resultJson.length} chars total, showing first ${TOOL_RESULT_LIMIT}]`;
+              const truncated = JSON.parse(resultJson.slice(0, TOOL_RESULT_LIMIT).replace(/"[^"]*$/, '') || '{}');
+              const capped = { ...truncated, _truncated: true, _originalSize: resultJson.length };
+              console.log(`✂️  Tool output truncated: ${resultJson.length} → ${TOOL_RESULT_LIMIT} chars`);
+              resultJson = JSON.stringify(capped) + JSON.stringify({ note }).slice(1, -1);
+              resultJson = resultJson.slice(0, TOOL_RESULT_LIMIT + 200);
+            }
+
+            console.log(result?.success ? '✅' : '❌', resultJson.slice(0, 200));
 
             messages.push({
               role: 'tool',
-              content: JSON.stringify(result),
+              content: resultJson,
               tool_call_id: call.id
             });
 
@@ -483,37 +561,67 @@ export async function runLoop(providerArg, modelArg, bootContent) {
       if (error.message === 'Aborted by user' || abortRequested) {
         abortedByUser = true;
       } else {
-        // AUTO-RECOVERY: provider rejected the model (deprecation, retirement,
-        // 404 model not found, 400 invalid model). Refetch the live list and
-        // prompt a re-pick instead of failing the turn.
-        const deprecationHit = error.status === 404
-          || error.status === 400
-          || /deprecat|not found|no longer|unsupported|invalid model|does not exist/i.test(error.message || '');
-        if (deprecationHit && apiKey) {
-          console.log(`\n⚠️  ${provider} rejected model "${model}" — likely deprecated. Refreshing model list...`);
-          const refreshed = await refreshModel(false);
-          if (refreshed && refreshed !== model) {
-            console.log(`Retrying this turn with ${refreshed}...`);
-            // Re-run the cycle with the new model by simulating a fresh turn
-            // (remove the error message we would have pushed, retry once)
-            try {
-              const response = await callLLMWithRetry(() =>
-                callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {})
-              );
-              if (response.content) {
-                console.log('\n' + response.content);
-                messages.push({ role: 'assistant', content: response.content });
-              }
-            } catch (retryError) {
-              console.error(`\n❌ Retry also failed: ${retryError.message}`);
-              messages.push({ role: 'assistant', content: `Error: ${retryError.message}` });
+        // CONTEXT OVERFLOW: "reduce the length of the messages" — compact hard and retry.
+        // This is NOT a deprecation; the old recovery misfired on it.
+        const isContextOverflow = error.status === 400
+          && /reduce the length|context (length|window)|maximum context|too (large|long)/i.test(error.message || '');
+        if (isContextOverflow) {
+          console.log('\n⚠️  Context overflow — compacting conversation and retrying...');
+          // Aggressive compaction: keep system + last 6 messages only
+          const systemMsg = messages.find(m => m.role === 'system');
+          const lastUser = messages.map((m, i) => ({ m, i })).filter(x => x.m.role === 'user').pop();
+          const recent = messages.slice(-6);
+          let summary = '## Earlier conversation (auto-compacted after context overflow):\n\n';
+          for (const msg of messages.filter(m => m.role !== 'system').slice(0, -6).slice(-10)) {
+            const role = msg.role === 'assistant' ? 'Assistant' : msg.role === 'tool' ? 'Tool' : 'User';
+            summary += `**${role}**: ${(msg.content || '').slice(0, 200)}\n\n`;
+          }
+          messages = [systemMsg, { role: 'system', content: summary }, ...recent].filter(Boolean);
+          try {
+            const response = await callLLMWithRetry(() =>
+              callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {})
+            );
+            if (response.content) {
+              console.log('\n' + response.content);
+              messages.push({ role: 'assistant', content: response.content });
+            } else if (response.tool_calls?.length) {
+              messages.push({ role: 'assistant', content: response.content || null, tool_calls: response.tool_calls });
+              console.log('(model wants tools after compaction — send the request again)');
             }
-          } else {
-            messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+          } catch (retryError) {
+            console.error(`\n❌ Retry after compaction failed: ${retryError.message}`);
+            messages.push({ role: 'assistant', content: `Error: ${retryError.message}` });
           }
         } else {
-          console.error(`\n❌ LLM error: ${error.message}`);
-          messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+          // DEPRECATION RECOVERY: provider rejected the model itself (404, or
+          // 400 that names the model). Refetch the live list and re-pick.
+          const deprecationHit = error.status === 404
+            || /deprecat|no longer served|model.*not found|invalid model|does not exist/i.test(error.message || '');
+          if (deprecationHit && apiKey) {
+            console.log(`\n⚠️  ${provider} rejected model "${model}" — likely deprecated. Refreshing model list...`);
+            const before = model;
+            const refreshed = await refreshModel(false);
+            if (refreshed && refreshed !== before) {
+              console.log(`Retrying this turn with ${refreshed}...`);
+              try {
+                const response = await callLLMWithRetry(() =>
+                  callLLMApi(messages, toolsList, provider, model, apiKey, config.customProviders || {})
+                );
+                if (response.content) {
+                  console.log('\n' + response.content);
+                  messages.push({ role: 'assistant', content: response.content });
+                }
+              } catch (retryError) {
+                console.error(`\n❌ Retry also failed: ${retryError.message}`);
+                messages.push({ role: 'assistant', content: `Error: ${retryError.message}` });
+              }
+            } else {
+              messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+            }
+          } else {
+            console.error(`\n❌ LLM error: ${error.message}`);
+            messages.push({ role: 'assistant', content: `Error: ${error.message}` });
+          }
         }
       }
     }
