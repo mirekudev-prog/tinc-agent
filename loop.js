@@ -344,6 +344,22 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     }
   });
 
+  // When the user types "/" at an empty prompt, immediately open the
+  // command selector (like Hermes). This does NOT use live ANSI redraw
+  // — it suspends readline and takes raw stdin, so no terminal corruption.
+  let slashTriggered = false;
+  rl.on('keypress', (str, key) => {
+    if (!idle || slashTriggered) return;
+    if (str === '/' && (!rl.line || rl.line === '')) {
+      slashTriggered = true;
+      rl.write(null, { ctrl: true, name: 'u' });
+      setImmediate(async () => {
+        slashTriggered = false;
+        await commandSelector();
+      });
+    }
+  });
+
   rl.on('close', () => {
     stdinEnded = true;
   });
@@ -376,6 +392,17 @@ export async function runLoop(providerArg, modelArg, bootContent) {
       }
     });
   };
+
+  // displayPrompt(): show the "> " text box during streaming so the user
+  // can type the next message while the model is working. Streamed output
+  // appears above this line. Typed input buffers into lineQueue and is
+  // delivered at the next steering checkpoint.
+  function displayPrompt() {
+    // Ensure the prompt is visible and ready for input
+    if (!idle) {
+      rl.prompt();
+    }
+  }
 
   // ============================================================
   // 1.5 SLASH COMMAND SELECTOR
@@ -1064,12 +1091,17 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         rounds++;
         if (abortRequested) { abortedByUser = true; break cycle; }
 
+        // Show the text box before streaming so the user can type the
+        // next message while the model works.
+        displayPrompt();
+
         // ---- GLITCH-FREE STREAMING ----
-        // Pause readline while the model streams: keystrokes buffer in the
-        // terminal line buffer instead of interleaving with/replaying the
-        // streamed output. No screen repaints, no cursor jumps — the stream
-        // owns the screen; typed input lands at the next steering checkpoint.
-        pauseInput();
+        // KEEP readline active during streaming so the text box (' > ') stays
+        // visible — the user can type the next message while the model works.
+        // Typed lines buffer into lineQueue via the 'line' handler and are
+        // delivered at the steering checkpoint below (no screen glitc hes,
+        // no disappeared prompt). The streaming output writes to stdout and
+        // readline redraws its prompt line after each chunk completes naturally.
         const response = await callLLMWithRetry(() => {
           if (abortRequested) throw new Error('Aborted by user');
           return callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {});
@@ -1081,7 +1113,6 @@ export async function runLoop(providerArg, modelArg, bootContent) {
           }
           return res;
         });
-        resumeInput();
 
         if (abortRequested) { abortedByUser = true; break cycle; }
 
@@ -1160,11 +1191,9 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             let guard = 0;
             while (cont.finish_reason === 'length' && guard < 20) {
               guard++;
-              pauseInput();
               cont = await callLLMWithRetry(() =>
                 callLLMStreaming(messages, toolsList, provider, model, apiKey, config.customProviders || {})
               );
-              resumeInput();
               if (cont.content) {
                 messages.push({ role: 'assistant', content: cont.content });
               }
@@ -1180,7 +1209,6 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         break;
       }
     } catch (error) {
-      resumeInput();
       if (error.message === 'Aborted by user' || abortRequested) {
         abortedByUser = true;
       } else {
