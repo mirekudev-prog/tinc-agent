@@ -23,6 +23,16 @@ import { createCompleter } from './completer.js';
 
 const SYSTEM_PROMPT = `You are TINC, a senior reverse-engineer and system thinker running in a terminal on Termux (Android). The user is a vibe coder who delegates all execution to you — take full ownership and work end-to-end until the task is actually done.
 
+TERMUX EXPERTISE:
+- You are running on Android in Termux. Prefix is /data/data/com.termux/files/usr. Home is $HOME. No systemd, no root by default, proot available for a Linux rootfs if needed.
+- Package manager: pkg (wraps apt). Use pkg install <name> -y. Packages: python, nodejs, git, openssh, termux-api, ffmpeg, imagemagick, jq, zip, proot-distro...
+- Android storage: termux-setup-storage grants ~/storage/shared (device storage). Always prefer $HOME for agent work.
+- Device control via Termux:API tools (termux, share): battery, clipboard, notifications, SMS, calls, location, torch, TTS, vibrate, wifi. These need the Termux:API app installed.
+- Background: termux-wake-lock keeps CPU alive for long jobs; use nohup or the bash tool with long timeouts for builds.
+- Long builds (gradle, large npm): suggest doing them on the device only if feasible; otherwise offer GitHub Actions or a remote builder as the alternative.
+- termux-open <file> opens files with Android apps; termux-open-url <url> opens the browser.
+- Known Termux quirks: some npm packages fail on ARM (node-gyp needs python+binutils); use --legacy-peer-deps if npm complains; pip may need --break-system-packages; lsof lacks -ti:PORT (use fuser).
+
 WORK ETHIC:
 - Use tools to act. Never describe what you would do — do it.
 - After a task, verify the result (run the code, check the file, re-read the output).
@@ -31,7 +41,7 @@ WORK ETHIC:
 - When the user sends a [MID-TASK INSTRUCTION], it arrived while you were working. Fold it into your current task immediately — it overrides earlier priorities.
 
 TOOLS:
-read, write, edit, bash, memory, github, task, web, web_search
+read, write, edit, bash, memory, github, task, web, web_search, termux, share
 
 RULES:
 - Be brutally concise. Zero fluff. Zero hallucinations.
@@ -184,7 +194,20 @@ export async function runLoop(providerArg, modelArg, bootContent) {
   // 1. INPUT QUEUE — set up FIRST so no line is ever lost
   // ============================================================
   const readline = await import('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const completer = createCompleter();
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    completer: (line, cb) => {
+      const { matches } = completer.complete(line);
+      // Common-prefix completion + full list display (readline prints it)
+      let common = matches.length ? matches[0] : line;
+      for (const m of matches) {
+        while (!m.startsWith(common)) common = common.slice(0, -1);
+      }
+      cb(null, [matches.length === 1 ? [common] : matches, common]);
+    }
+  });
 
   const lineQueue = [];
   let lineResolver = null;   // set while waiting at the main prompt
@@ -387,8 +410,21 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     // ---- Slash commands ----
     if (trimmed.startsWith('/')) {
       const parts = trimmed.split(/\s+/);
-      const cmd = parts[0].toLowerCase();
+      const rawCmd = parts[0].toLowerCase();
       const args = parts.slice(1);
+
+      // Prefix matching: /mo → /model, /lo → /login, /ex → /exit.
+      // Ambiguous prefixes list matches instead of guessing.
+      let cmd = rawCmd;
+      if (!SLASH_COMMANDS[rawCmd] && !rawCmd.startsWith('/model')) {
+        const candidates = Object.keys(SLASH_COMMANDS).filter(k => k.split(' ')[0].startsWith(rawCmd));
+        if (candidates.length === 1) {
+          cmd = candidates[0].split(' ')[0];
+        } else if (candidates.length > 1) {
+          console.log(`Ambiguous: "${rawCmd}" → ${candidates.map(c => c.split(' ')[0]).join(', ')}`);
+          continue;
+        }
+      }
 
       switch (cmd) {
         case '/help':

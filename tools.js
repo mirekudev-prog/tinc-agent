@@ -352,5 +352,67 @@ export const tools = {
         };
       }
     }
+  },
+
+  termux: {
+    description: 'Run Termux:API commands on the Android device (requires the Termux:API app). Actions: battery-status, clipboard-get, clipboard-set, notification, toast, vibrate, share, open-url, tts-speak, termux-info, wifi-status, location, sms-list, sms-send, call-log, contact-list, flashlight, volume, brightness, termux-wake-lock, termux-wake-unlock. If a command is missing, termux-api is not installed.',
+    schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'Termux:API action name, e.g. battery-status' },
+        args: { type: 'string', description: 'Arguments string passed to the command (e.g. for clipboard-set: the text; for notification: --title "X" --content "Y")' }
+      },
+      required: ['action'],
+      additionalProperties: false
+    },
+    async execute({ action, args = '' }) {
+      const cmd = `termux-${action} ${args}`.trim();
+      const result = await run(cmd, { timeout: 15000 });
+      if (result.error && /not found/i.test(result.error)) {
+        return {
+          success: false,
+          error: 'Termux:API command not found. Install the Termux:API app (F-Droid/Play) and run: pkg install termux-api'
+        };
+      }
+      return {
+        success: !result.error,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error || undefined
+      };
+    }
+  },
+
+  share: {
+    description: 'Share a file or text using the Android share sheet (Termux:API termux-share). text= text to share, or file= path to share. Optional title.',
+    schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Text to share' },
+        file: { type: 'string', description: 'File path to share' },
+        title: { type: 'string', description: 'Title for the share sheet' },
+        action: { type: 'string', enum: ['view', 'edit', 'send'], description: 'How to share (default send)' }
+      },
+      additionalProperties: false
+    },
+    async execute({ text, file, title, action }) {
+      let cmd = 'termux-share';
+      if (action) cmd += ` --action ${action}`;
+      if (title) cmd += ` --title ${JSON.stringify(title)}`;
+      if (file) {
+        cmd += ` ${JSON.stringify(file)}`;
+      } else if (text) {
+        cmd += ` ${JSON.stringify(text)}`;
+      } else {
+        return { success: false, error: 'Provide text or file' };
+      }
+      const result = await run(cmd, { timeout: 30000 });
+      return {
+        success: !result.error,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: result.error || undefined
+      };
+    }
   }
 };
