@@ -65,30 +65,55 @@ if [ ! -d "$INSTALL_DIR" ]; then
   echo -e "${GREEN}✅ Cloned to $INSTALL_DIR${NC}"
 fi
 
-# Install globally
+# Install dependencies (clone has no node_modules — it's gitignored)
+echo ""
+echo "📥 Installing dependencies (commander)..."
+cd "$INSTALL_DIR"
+npm install 2>&1 | sed 's/^/  /'
+if [ $? -ne 0 ]; then
+  echo -e "${RED}❌ npm install failed.${NC}"
+  echo "Fix manually: cd $INSTALL_DIR && npm install"
+  exit 1
+fi
+echo -e "${GREEN}✅ Dependencies installed.${NC}"
+
+# Install globally (symlinks the bin entry as `tinc`)
 echo ""
 echo "📥 Installing TINC globally..."
-cd "$INSTALL_DIR"
 npm install -g . 2>&1 | sed 's/^/  /'
-
 if [ $? -ne 0 ]; then
-  echo -e "${RED}❌ Global install failed.${NC}"
-  echo ""
-  echo "Try running locally instead:"
-  echo "  cd $INSTALL_DIR && node index.js run"
+  echo -e "${YELLOW}⚠️  Global install failed — falling back to local launcher.${NC}"
+  mkdir -p "$HOME/.local/bin"
+  cat > "$HOME/.local/bin/tinc" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+exec node "$HOME/tinc-agent/index.js" "$@"
+EOF
+  chmod +x "$HOME/.local/bin/tinc"
+  echo "Created launcher at ~/.local/bin/tinc"
+  echo "Make sure ~/.local/bin is on your PATH."
+fi
+
+echo -e "${GREEN}✅ TINC installed.${NC}"
+echo ""
+
+# Smoke test: the entry point must load
+echo "🔍 Smoke test: loading TINC entry point..."
+if node "$INSTALL_DIR/index.js" --help > /dev/null 2>&1; then
+  echo -e "${GREEN}✅ TINC loads correctly.${NC}"
+else
+  echo -e "${RED}❌ TINC failed to load. Run manually to see the error:${NC}"
+  echo "  node $INSTALL_DIR/index.js --help"
   exit 1
 fi
 
-echo -e "${GREEN}✅ TINC installed globally.${NC}"
+# Verify command availability
 echo ""
-
-# Verify binary is on PATH
 if command -v tinc &> /dev/null; then
   echo -e "${GREEN}✅ 'tinc' command is ready.${NC}"
 else
-  echo -e "${YELLOW}⚠️  'tinc' not found on PATH.${NC}"
-  echo "The binary is at: $(which tinc 2>/dev/null || echo '$INSTALL_DIR/index.js')"
-  echo "Add to PATH or run: node $INSTALL_DIR/index.js run"
+  echo -e "${YELLOW}⚠️  'tinc' not found on PATH yet.${NC}"
+  echo "Run it directly: node $INSTALL_DIR/index.js run"
+  echo "Or add ~/.local/bin to PATH and restart your shell."
 fi
 
 echo ""
@@ -98,16 +123,19 @@ echo "Launch anytime by typing:"
 echo "  tinc"
 echo ""
 echo "First run triggers the setup wizard:"
-echo "  1. Select provider (groq, mistral, cerebras, nvidia)"
+echo "  1. Select provider (groq, mistral, cerebras, nvidia, openrouter, custom)"
 echo "  2. Enter API key"
-echo "  3. Select model"
-echo "  4. You're in the TUI loop"
+echo "  3. Select model from the live list"
+echo "  4. You're in the agent loop"
 echo ""
 
-read -p "Launch TINC now? (y/n): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  exec tinc
+# Only prompt when interactive (piped installs skip this cleanly)
+if [ -t 0 ]; then
+  read -p "Launch TINC now? (y/n): " -n 1 -r
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    exec tinc
+  fi
 fi
 
 echo "Run 'tinc' anytime to start."
