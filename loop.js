@@ -19,7 +19,7 @@ import os from 'os';
 import path from 'path';
 import { tools } from './tools.js';
 import { loadBoot, readMemory, loadProjectContext } from './memory.js';
-import { snapshotBeforeTurn, undoTurn, redoTurn, listSnapshots, trackFileChange } from './safety.js';
+import { snapshotBeforeTurn, undoTurn, redoTurn, listSnapshots, getTurnChanges, restoreFiles, showSnapshotFile } from './safety.js';
 import { getConfig, fetchModels, sanitizePrompt, saveConfig } from './config.js';
 import { loadSession, saveSession, createSession, listSessions, renameSession, deleteSession, loadTask, clearTask } from './session.js';
 import { callLLMWithRetry, callLLMApi, callLLMStreaming, getRateStatus } from './api.js';
@@ -294,6 +294,7 @@ const SLASH_COMMANDS = {
   '/clear': 'Clear conversation context (keep config)',
   '/task [clear]': 'Show/clear current task',
   '/memory': 'Memory worker status; /memory model [provider] to change its model; /memory on|off',
+  '/new [name]': 'Start a new session (fresh context)',
   '/reload': 'Restart TINC process (fresh code) and resume this session',
   '/stop': 'Abort the running agent cycle (or Ctrl+C)',
   '/login': 'Change provider/model/API key interactively',
@@ -317,6 +318,119 @@ export async function runLoop(providerArg, modelArg, bootContent) {
         while (!m.startsWith(common)) common = common.slice(0, -1);
       }
       cb(null, [matches.length === 1 ? [common] : matches, common]);
+    }
+  });
+
+  // ============================================================
+  // 1.5 LIVE SLASH MENU — type "/" → all commands appear under the
+  // prompt; each keystroke filters; Enter clears the menu and runs.
+  // Works while you type at the prompt, inline (touch-scroll safe).
+  // ============================================================
+  let slashMenuLines = 0;          // rows the menu currently occupies
+  let lastSlashLine = '';
+
+  function clearSlashMenu() {
+    if (slashMenuLines === 0) return;
+    // Move up over the menu rows and clear each
+    process.stdout.write(`\x1b[${slashMenuLines}A`);
+    for (let i = 0; i < slashMenuLines; i++) {
+      process.stdout.write('\x1b[2K');
+      if (i < slashMenuLines - 1) process.stdout.write('\x1b[1B');
+    }
+    // Return to the prompt line start and redraw the prompt + typed text
+    process.stdout.write(`\x1b[${slashMenuLines}A`);
+    process.stdout.write('\x1b[2K');
+    rl.prompt(true);
+    slashMenuLines = 0;
+  }
+
+  function renderSlashMenu(line) {
+    // Only at the main prompt (idle), for slash input
+    if (!idle || !line.startsWith('/')) {
+      if (slashMenuLines > 0) clearSlashMenu();
+      lastSlashLine = line;
+      return;
+    }
+
+    const trimmed = line.trim();
+    const keys = Object.keys(SLASH_COMMANDS);
+    const matches = trimmed.length <= 1
+      ? keys
+      : keys.filter(k => k.startsWith(trimmed) || k.split(' ')[0].startsWith(trimmed));
+    const shown = matches.slice(0, 10);
+
+    if (slashMenuLines > 0) {
+      // Erase previous menu rows
+      process.stdout.write(`\x1b[${slashMenuLines}A`);
+      for (let i = 0; i < slashMenuLines; i++) {
+        process.stdout.write('\x1b[2K');
+        if (i < slashMenuLines - 1) process.stdout.write('\x1b[1B');
+      }
+      process.stdout.write(`\x1b[${slashMenuLines}A`);
+    }
+
+    const isExact = keys.includes(trimmed) || keys.some(k => k.split(' ')[0] === trimmed);
+    process.stdout.write('\n');      // row 1: hint
+    if (isExact) {
+      process.stdout.write(`\x1b[90m↵ run "${trimmed}" · Esc cancel\x1b[0m\n`);
+    } else if (shown.length === 0) {
+      process.stdout.write(`\x1b[90m(no matching command — Esc cancel)\x1b[0m\n`);
+    } else {
+      process.stdout.write(`\x1b[90m${shown.length} of ${matches.length} · ↑↓ Tab complete · ↵ run · Esc cancel\x1b[0m\n`);
+    }
+    shown.forEach((k, i) => {
+      const desc = SLASH_COMMANDS[k];
+      const isMatch = k.split(' ')[0] === trimmed;
+      const color = isMatch ? '\x1b[92m\x1b[1m' : '\x1b[94m';
+      process.stdout.write(`  ${color}${k}\x1b[0m \x1b[90m— ${desc}\x1b[0m\n`);
+    });
+
+    slashMenuLines = shown.length + 1;
+    lastSlashLine = line;
+
+    // Put the cursor back on the prompt row with the typed text intact
+    process.stdout.write(`\x1b[${slashMenuLines}A`);
+    process.stdout.write('\r\x1b[2K');
+    rl.prompt(true);
+  }
+
+  // Emit keypress events on the input stream
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+  let menuArrowsActive = false;   // true when a menu arrow was pressed
+  process.stdin.on('keypress', (str, key) => {
+    if (!idle) return;            // menu only at the main prompt
+
+    // Escape closes the menu
+    if (key && key.name === 'escape' && slashMenuLines > 0) {
+      clearSlashMenu();
+      return;
+    }
+
+    // While the slash menu is open, ↑/↓ move the selection instead of history
+    if (slashMenuLines > 0 && key && (key.name === 'up' || key.name === 'down')) {
+      // Re-render with the next command pre-filled into the prompt
+      const trimmed = lastSlashLine.trim();
+      const keys = Object.keys(SLASH_COMMANDS);
+      const matches = trimmed.length <= 1 ? keys : keys.filter(k => k.startsWith(trimmed) || k.split(' ')[0].startsWith(trimmed));
+      if (!matches.length) return;
+      const idx = matches.findIndex(k => k.split(' ')[0] === trimmed);
+      const next = key.name === 'down'
+        ? matches[(idx + 1) % matches.length]
+        : matches[(idx - 1 + matches.length) % matches.length];
+      // Rewrite the prompt line with the selected command
+      rl.write(null, { ctrl: true, name: 'u' });   // clear line (ctrl-u)
+      rl.write(next.split(' ')[0]);
+      return;
+    }
+
+    // Any other key: re-render the filtered menu for the current line
+    const line = rl.line || '';
+    if (line.startsWith('/') || (slashMenuLines > 0 && line === '')) {
+      renderSlashMenu(line);
+    } else if (slashMenuLines > 0) {
+      clearSlashMenu();
     }
   });
 
@@ -527,6 +641,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
     // STATUS LINE before every prompt — OpenCode-style visibility
     const input = await ask(`\n${statusLine(provider, model, messages)}\n> `);
     idle = false;
+    // Clear any open slash menu the moment a line is submitted
+    if (slashMenuLines > 0) clearSlashMenu();
     const trimmed = input.trim();
     if (!trimmed) continue;
 
@@ -845,7 +961,8 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             snaps.forEach((s, i) => console.log(`  ${i + 1}. ${s.at.toLocaleString()} — "${s.msg}"`));
             break;
           }
-          console.log(await undoTurn(process.cwd()));
+          const steps = parseInt(args[0]) > 0 ? parseInt(args[0]) : 1;
+          console.log(await undoTurn(process.cwd(), steps));
           break;
         }
 
@@ -1085,14 +1202,6 @@ export async function runLoop(providerArg, modelArg, bootContent) {
             }
 
             console.log(result?.success ? '✅' : '❌', resultJson.slice(0, 200));
-
-            // JOURNAL the change for /undo (write/edit only)
-            if (result?.success && ['write', 'edit'].includes(call.function.name)) {
-              try {
-                const tracked = JSON.parse(call.function.arguments || '{}').path;
-                if (tracked) await trackFileChange(process.cwd(), tracked);
-              } catch {}
-            }
 
             messages.push({
               role: 'tool',

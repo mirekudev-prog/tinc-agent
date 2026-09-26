@@ -13,6 +13,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(os.homedir(), '.tinc');
 const MEMORY_FILE = path.join(DATA_DIR, 'memory.md');
 
+// Safety module is imported lazily to avoid a cycle (safety -> config)
+async function safety() {
+  return await import('./safety.js');
+}
+
 const SELF_FILES = ['boot.md', 'tools.js', 'index.js', 'loop.js', 'memory.js', 'config.js', 'api.js', 'session.js', 'tui.js', 'package.json'];
 
 async function ensureDataDir() {
@@ -372,6 +377,50 @@ export const tools = {
         stderr: result.stderr,
         error: result.error || undefined
       };
+    }
+  },
+
+  snapshot: {
+    description: 'Undo/redo file changes from the current turn, inspect them, or view pre-turn file versions. Actions: "undo" (revert all changes this turn — write, edit, AND bash), "redo" (re-apply undone changes), "changed" (list files changed this turn), "show" (view the pre-turn version of a file), "restore" (undo only specific files). Use when the user says "undo that", "revert", "put it back", "redo".',
+    schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['undo', 'redo', 'changed', 'show', 'restore'], description: 'Snapshot action' },
+        path: { type: 'string', description: 'File path (for show / restore)' },
+        files: { type: 'array', items: { type: 'string' }, description: 'File paths (for restore)' },
+        steps: { type: 'number', description: 'Undo N turns back (undo only, default 1)' }
+      },
+      required: ['action'],
+      additionalProperties: false
+    },
+    async execute({ action, path: p, files, steps = 1 }) {
+      const s = await safety();
+      const cwd = process.cwd();
+      switch (action) {
+        case 'undo': {
+          const msg = await s.undoTurn(cwd, steps);
+          return { success: !/failed|No snapshots/i.test(msg), message: msg };
+        }
+        case 'redo': {
+          const msg = await s.redoTurn(cwd);
+          return { success: !/failed/i.test(msg), message: msg };
+        }
+        case 'changed': {
+          const changes = await s.getTurnChanges(cwd);
+          return { success: true, ...changes };
+        }
+        case 'show': {
+          if (!p) return { success: false, error: 'path required for show' };
+          return await s.showSnapshotFile(cwd, p);
+        }
+        case 'restore': {
+          const list = files || (p ? [p] : null);
+          if (!list || !list.length) return { success: false, error: 'files or path required for restore' };
+          return await s.restoreFiles(cwd, list);
+        }
+        default:
+          return { success: false, error: 'Unknown action' };
+      }
     }
   },
 

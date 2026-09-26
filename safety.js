@@ -1,23 +1,23 @@
 /**
- * TINC Safety Net — journal-based undo/redo for agent file changes
+ * TINC Safety Net — snapshot-based undo/redo covering ALL tools
+ * (write, edit, AND bash — rm, sed -i, echo >, mv, package managers...)
  *
  * Design:
- *   - Before each turn: snapshot the tree into a shadow git repo (as before).
- *     This HEAD is exactly "state before this turn".
- *   - During the turn: every successful write/edit tool call appends the
- *     path to the turn journal (last-turn file: .tinc-snapshots/journal.json).
- *   - /undo: park current versions of journaled files into redo-files/,
- *     then restore each journaled path from the snapshot HEAD — or delete
- *     it if it didn't exist before the turn (agent-created file).
- *   - /redo: copy the parked versions back.
+ *   - Before every turn: sync the tree into the shadow repo and commit.
+ *     HEAD is always "state at the start of the current turn".
+ *   - /undo: re-sync the tree into the shadow worktree (uncommitted), diff
+ *     against HEAD → every file changed this turn by ANY tool. Park current
+ *     versions in redo-files/, restore pre-turn versions, delete files that
+ *     didn't exist before. No journal needed — the diff IS the journal.
+ *   - /undo N: walk back N snapshots for multi-step undo.
+ *   - /redo: re-apply parked versions.
+ *   - The agent itself can undo via the `snapshot` tool (action: undo /
+ *     redo / changed / show) — so "undo that" in plain language works.
  *
- * Precise: only files the agent's write/edit tools touched are reverted.
- * (Changes made purely via bash are not journaled — known limitation.)
  * User git repos are never touched. Best-effort: failures never break the loop.
  */
 
 import fs from 'fs/promises';
-import os from 'os';
 import path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -25,7 +25,6 @@ import { promisify } from 'util';
 const execAsync = promisify(exec);
 
 const SNAP_DIR = '.tinc-snapshots';
-const JOURNAL_FILE = path.join(SNAP_DIR, 'journal.json');
 const REDO_DIR = path.join(SNAP_DIR, 'redo-files');
 const EXCLUDES = [
   '.git', '.tinc-snapshots', 'node_modules', 'dist', 'build',
@@ -63,34 +62,23 @@ function excludeArgs() {
   return EXCLUDES.map(e => `--exclude='${e}'`).join(' ');
 }
 
-// ---------- JOURNAL ----------
-
-async function loadJournal(cwd) {
-  try {
-    return JSON.parse(await fs.readFile(path.join(cwd, JOURNAL_FILE), 'utf-8'));
-  } catch {
-    return [];
-  }
-}
-
-async function saveJournal(cwd, paths) {
+/** Copy the real working tree into the shadow worktree (uncommitted). */
+async function syncTreeIntoShadow(cwd) {
   const sp = snapPath(cwd);
-  await fs.mkdir(sp, { recursive: true });
-  await fs.writeFile(path.join(cwd, JOURNAL_FILE), JSON.stringify(paths, null, 2), 'utf-8');
+  await run("find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +", sp);
+  const tar = await run(`tar cf - ${excludeArgs()} . | tar xf - -C ${JSON.stringify(sp)}`, cwd);
+  return tar.ok;
 }
 
 /**
- * Called at the START of every user turn: clears the journal (new turn)
- * and snapshots the tree. The snapshot commits only when files changed.
+ * START of every user turn: sync + commit if the tree changed.
+ * HEAD = state before this turn begins.
  */
 export async function snapshotBeforeTurn(cwd, userPrompt) {
   try {
     await ensureShadowRepo(cwd);
-    await saveJournal(cwd, []);           // fresh journal for this turn
+    if (!(await syncTreeIntoShadow(cwd))) return false;
     const sp = snapPath(cwd);
-    await run("find . -mindepth 1 -maxdepth 1 -not -name .git -exec rm -rf {} +", sp);
-    const tar = await run(`tar cf - ${excludeArgs()} . | tar xf - -C ${JSON.stringify(sp)}`, cwd);
-    if (!tar.ok) return false;
     await run('git add -A', sp);
     const status = await run('git status --porcelain', sp);
     if (!status.stdout.trim()) return false;
@@ -103,91 +91,181 @@ export async function snapshotBeforeTurn(cwd, userPrompt) {
 }
 
 /**
- * Called after every SUCCESSFUL write/edit tool execution — records the
- * path in the current turn's journal. Must be called from tools or loop.
+ * Files changed since snapshot HEAD — everything this turn touched via
+ * ANY tool (write, edit, bash). Syncs the tree first.
+ * Returns { changed, created, deleted } as relative paths.
  */
-export async function trackFileChange(cwd, filePath) {
+export async function getTurnChanges(cwd) {
   try {
-    const journal = await loadJournal(cwd);
-    if (!journal.includes(filePath)) journal.push(filePath);
-    await saveJournal(cwd, journal);
-  } catch {}
+    await ensureShadowRepo(cwd);
+    await syncTreeIntoShadow(cwd);
+    const sp = snapPath(cwd);
+
+    const head = await run('git rev-parse HEAD', sp);
+    if (!head.ok) return { changed: [], created: [], deleted: [] };
+
+    const st = await run('git status --porcelain', sp);
+    const changed = [];
+    const created = [];
+    const deleted = [];
+
+    for (const line of st.stdout.split('\n')) {
+      if (!line.trim()) continue;
+      const statusCode = line.slice(0, 2);
+      let p = line.slice(3).trim();
+      if (p.includes(' -> ')) {              // renames: track both sides
+        const [oldP, newP] = p.split(' -> ').map(s => s.replace(/^"|"$/g, ''));
+        deleted.push(oldP);
+        created.push(newP);
+        changed.push(newP);
+        continue;
+      }
+      p = p.replace(/^"|"$/g, '');
+      if (!p) continue;
+      if (statusCode.includes('D')) deleted.push(p);
+      else if (statusCode.includes('?')) created.push(p);
+      else changed.push(p);
+    }
+    return {
+      changed: [...new Set(changed)],
+      created: [...new Set(created)],
+      deleted: [...new Set(deleted)]
+    };
+  } catch {
+    return { changed: [], created: [], deleted: [] };
+  }
 }
 
-// ---------- UNDO / REDO ----------
+async function fileInHead(cwd, rel) {
+  const sp = snapPath(cwd);
+  const r = await run(`git cat-file -e ${JSON.stringify('HEAD:' + rel)} 2>/dev/null`, sp);
+  return r.ok;
+}
+
+async function restoreFromHead(cwd, rel) {
+  const sp = snapPath(cwd);
+  const show = await run(`git show ${JSON.stringify('HEAD:' + rel)}`, sp);
+  if (!show.ok) return false;
+  const abs = path.resolve(cwd, rel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await fs.writeFile(abs, show.stdout, 'utf-8');
+  return true;
+}
+
+/** Park the current version of a file (if it exists) for /redo. */
+async function parkForRedo(cwd, rel) {
+  const abs = path.resolve(cwd, rel);
+  const parkPath = path.join(cwd, REDO_DIR, rel);
+  try {
+    const cur = await fs.readFile(abs);
+    await fs.mkdir(path.dirname(parkPath), { recursive: true });
+    await fs.writeFile(parkPath, cur);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
- * Undo the last turn's tracked file changes.
+ * Undo changes since snapshot HEAD. Covers every tool including bash.
+ * @param {number} steps  walk back N snapshots (default 1)
  */
-export async function undoTurn(cwd) {
+export async function undoTurn(cwd, steps = 1) {
   try {
     const sp = snapPath(cwd);
     const exists = await fs.stat(sp).catch(() => null);
     if (!exists) return 'No snapshots yet — nothing to undo.';
 
-    const journal = await loadJournal(cwd);
-    if (!journal.length) {
-      return 'No tracked file changes in the last turn (bash-only changes are not journaled).';
+    if (steps > 1) {
+      const count = await run('git rev-list --count HEAD', sp);
+      const n = parseInt(count.stdout?.trim());
+      if (isNaN(n) || n < steps) return `Only ${isNaN(n) ? 0 : n} snapshot(s) — can't undo ${steps}.`;
+      await run(`git reset -q --hard HEAD~${steps - 1}`, sp);
     }
 
-    const head = await run('git rev-parse HEAD', sp);
-    if (!head.ok) return 'Snapshot repo has no commits yet.';
-    const headSha = head.stdout.trim();
+    const { changed, created, deleted } = await getTurnChanges(cwd);
+    const all = [...new Set([...changed, ...created, ...deleted])];
+    if (!all.length) return 'No file changes to undo in the last turn.';
 
-    // Park current versions for redo
     const redoBase = path.join(cwd, REDO_DIR);
     await fs.mkdir(redoBase, { recursive: true });
 
-    let undone = 0;
-    let deleted = 0;
+    let restored = 0;
+    let removed = 0;
     const report = [];
 
-    for (const rel of journal) {
+    for (const rel of all) {
       const abs = path.resolve(cwd, rel);
-      // Security: only revert paths inside the cwd
-      if (!abs.startsWith(path.resolve(cwd))) continue;
+      if (!abs.startsWith(path.resolve(cwd))) continue;   // stay inside cwd
 
-      const existedBefore = await run(`git cat-file -e ${JSON.stringify(headSha + ':' + rel)} 2>/dev/null`, sp);
+      await parkForRedo(cwd, rel);
 
-      // Park the current version (if it exists)
-      try {
-        const cur = await fs.readFile(abs);
-        const parkPath = path.join(redoBase, rel);
-        await fs.mkdir(path.dirname(parkPath), { recursive: true });
-        await fs.writeFile(parkPath, cur);
-      } catch { /* file doesn't currently exist — nothing to park */ }
-
-      if (existedBefore.ok) {
-        // Restore the pre-turn version
-        const show = await run(`git show ${JSON.stringify(headSha + ':' + rel)}`, sp);
-        if (show.ok) {
-          await fs.mkdir(path.dirname(abs), { recursive: true });
-          await fs.writeFile(abs, show.stdout, 'utf-8');
-          undone++;
+      if (await fileInHead(cwd, rel)) {
+        if (await restoreFromHead(cwd, rel)) {
+          restored++;
           report.push(`restored ${rel}`);
         }
       } else {
-        // Agent created this file — remove it
         try {
           await fs.unlink(abs);
-          deleted++;
+          removed++;
           report.push(`deleted ${rel}`);
         } catch {}
       }
     }
 
-    if (undone === 0 && deleted === 0) {
-      return 'Nothing to undo (no restorable changes found).';
-    }
-
-    return `↩️  Undone: ${undone} restored, ${deleted} deleted.\n    ${report.slice(0, 6).join('\n    ')}${report.length > 6 ? `\n    ...+${report.length - 6} more` : ''}\n    /redo to re-apply.`;
+    if (!restored && !removed) return 'Nothing restorable found.';
+    return `↩️  Undone: ${restored} restored, ${removed} deleted.\n    ${report.slice(0, 6).join('\n    ')}${report.length > 6 ? `\n    ...+${report.length - 6} more` : ''}\n    /redo to re-apply.`;
   } catch (e) {
     return 'Undo failed: ' + (e.message || e);
   }
 }
 
 /**
- * Redo: re-apply the parked (undone) versions.
+ * Undo specific files only (for the agent's snapshot tool).
+ */
+export async function restoreFiles(cwd, files) {
+  try {
+    const redoBase = path.join(cwd, REDO_DIR);
+    await fs.mkdir(redoBase, { recursive: true });
+
+    let restored = 0;
+    let removed = 0;
+    const report = [];
+    for (const rel of files) {
+      const abs = path.resolve(cwd, rel);
+      if (!abs.startsWith(path.resolve(cwd))) continue;
+      await parkForRedo(cwd, rel);
+      if (await fileInHead(cwd, rel)) {
+        if (await restoreFromHead(cwd, rel)) { restored++; report.push(`restored ${rel}`); }
+      } else {
+        try {
+          await fs.unlink(abs);
+          removed++;
+          report.push(`deleted ${rel}`);
+        } catch {}
+      }
+    }
+    return { success: true, restored, removed, report };
+  } catch (e) {
+    return { success: false, error: String(e.message || e) };
+  }
+}
+
+/**
+ * Show the pre-turn (snapshot HEAD) version of a file.
+ */
+export async function showSnapshotFile(cwd, rel) {
+  const sp = snapPath(cwd);
+  if (!(await fileInHead(cwd, rel))) {
+    return { success: false, error: `${rel} does not exist in the pre-turn snapshot` };
+  }
+  const show = await run(`git show ${JSON.stringify('HEAD:' + rel)}`, sp);
+  return { success: show.ok, content: show.stdout, error: show.ok ? undefined : show.stderr };
+}
+
+/**
+ * Redo: re-apply parked (undone) versions.
  */
 export async function redoTurn(cwd) {
   try {
